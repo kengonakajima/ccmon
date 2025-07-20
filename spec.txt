@@ -1,0 +1,14 @@
+■ CCMon : Claude Code Monitor  仕様
+
+CCMonは、macOS用の、Claude Code (以下CC)の活動状況を、音で表現するツールです。
+
+CCの活動状況は、会話ログの動きを監視します。
+会話ログは、以下の場所にあるので
+~/.claude/projects
+ここを3秒に1回監視し、ここのファイルが更新されたら、
+5秒間はピコピコ音をならします。音は、Sin関数で生成した音をいろいろなピッチで鳴らします。
+
+CCMonは、python3の単発スクリプトで、 python3 ccmon.py で実行し、モニタし続けます。
+止めるにはCtrl-Cで止めます。
+
+
