@@ -113,16 +113,16 @@ class SoundPlayer:
         self.pyaudio.terminate()
 
 
-class ClaudeProcessMonitor:
-    """Claude CLIプロセスの状態を監視するクラス"""
+class ClaudeNetworkMonitor:
+    """Claude CLIプロセスのネットワーク活動を監視するクラス"""
     
     def __init__(self):
-        self.last_active = None
+        self.last_bytes_sent = {}
+        self.last_bytes_received = {}
         
-    def is_claude_active(self):
-        """Claude CLIプロセスが実行中（R状態）かどうかを確認"""
+    def get_claude_processes(self):
+        """Claude CLIプロセスのPIDリストを取得"""
         try:
-            # ps コマンドでclaude プロセスを取得
             result = subprocess.run(
                 ['ps', 'aux'],
                 capture_output=True,
@@ -130,23 +130,106 @@ class ClaudeProcessMonitor:
                 check=True
             )
             
-            # claude プロセスを探す
+            pids = []
             for line in result.stdout.split('\n'):
-                if 'claude' in line and not 'grep' in line and not 'Claude.app' in line:
-                    # プロセス情報を解析
+                if 'claude' in line and not 'grep' in line and not 'Claude.app' in line and not 'ccmon' in line:
                     parts = line.split()
-                    if len(parts) >= 8:
-                        # STATE列（通常8列目）をチェック
-                        state = parts[7]
-                        # R（実行中）またはR+（フォアグラウンドで実行中）の場合
-                        if 'R' in state:
-                            return True
+                    if len(parts) >= 2:
+                        pids.append(parts[1])
             
-            return False
+            return pids
             
         except Exception as e:
-            print(f"プロセス監視エラー: {e}")
-            return False
+            print(f"プロセス取得エラー: {e}")
+            return []
+    
+    def get_network_activity(self, pid):
+        """特定のプロセスのネットワーク活動を取得"""
+        try:
+            # nettopコマンドでネットワーク統計を取得
+            result = subprocess.run(
+                ['nettop', '-x', '-l', '1', '-p', pid],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            # 送受信バイト数を解析
+            for line in result.stdout.split('\n'):
+                if pid in line:
+                    # nettopの出力形式: PID ... bytes_in bytes_out
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # 数値を見つける
+                        numbers = []
+                        for part in parts:
+                            try:
+                                # K, M, Gなどの単位を処理
+                                if part.endswith('K'):
+                                    numbers.append(float(part[:-1]) * 1024)
+                                elif part.endswith('M'):
+                                    numbers.append(float(part[:-1]) * 1024 * 1024)
+                                elif part.endswith('G'):
+                                    numbers.append(float(part[:-1]) * 1024 * 1024 * 1024)
+                                else:
+                                    try:
+                                        numbers.append(float(part))
+                                    except:
+                                        pass
+                            except:
+                                pass
+                        
+                        if len(numbers) >= 2:
+                            return numbers[-2], numbers[-1]  # bytes_in, bytes_out
+            
+            return 0, 0
+            
+        except Exception:
+            # nettopが使えない場合は、lsofでTCP接続の存在を確認
+            try:
+                result = subprocess.run(
+                    ['lsof', '-p', pid],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                # TCP接続があるかチェック
+                tcp_connections = 0
+                for line in result.stdout.split('\n'):
+                    if 'TCP' in line and 'ESTABLISHED' in line:
+                        tcp_connections += 1
+                
+                # 接続があれば活動ありとみなす
+                return tcp_connections, tcp_connections
+                
+            except:
+                return 0, 0
+    
+    def has_network_activity(self):
+        """Claude CLIプロセスにネットワーク活動があるかどうかを確認"""
+        pids = self.get_claude_processes()
+        
+        for pid in pids:
+            bytes_in, bytes_out = self.get_network_activity(pid)
+            
+            # 前回の値と比較
+            last_in = self.last_bytes_received.get(pid, 0)
+            last_out = self.last_bytes_sent.get(pid, 0)
+            
+            # データ転送があれば活動中
+            if bytes_in > last_in or bytes_out > last_out:
+                self.last_bytes_received[pid] = bytes_in
+                self.last_bytes_sent[pid] = bytes_out
+                return True
+            
+            # 初回またはTCP接続がある場合も活動中とみなす
+            if pid not in self.last_bytes_received and (bytes_in > 0 or bytes_out > 0):
+                self.last_bytes_received[pid] = bytes_in
+                self.last_bytes_sent[pid] = bytes_out
+                return True
+        
+        return False
 
 
 class ClaudeProjectsHandler(FileSystemEventHandler):
@@ -185,13 +268,13 @@ def main():
     
     print("CCMon - Claude Code Monitor")
     print(f"監視ディレクトリ: {watch_dir}")
-    print("監視項目: ファイル更新 + プロセス実行状態")
+    print("監視項目: ファイル更新 + ネットワーク活動")
     print("Ctrl+Cで終了します。")
     print("-" * 50)
     
-    # 音声プレイヤー、プロセスモニター、イベントハンドラーの初期化
+    # 音声プレイヤー、ネットワークモニター、イベントハンドラーの初期化
     sound_player = SoundPlayer()
-    process_monitor = ClaudeProcessMonitor()
+    network_monitor = ClaudeNetworkMonitor()
     event_handler = ClaudeProjectsHandler(sound_player)
     
     # ファイルシステム監視の開始
@@ -199,30 +282,30 @@ def main():
     observer.schedule(event_handler, str(watch_dir), recursive=True)
     observer.start()
     
-    # プロセス監視用の変数
-    last_process_sound = datetime.now() - timedelta(seconds=20)
+    # ネットワーク監視用の変数
+    last_network_sound = datetime.now() - timedelta(seconds=20)
     was_active = False
     
     try:
         while True:
-            # プロセス状態をチェック（3秒ごと）
-            is_active = process_monitor.is_claude_active()
+            # ネットワーク活動をチェック（3秒ごと）
+            has_activity = network_monitor.has_network_activity()
             current_time = datetime.now()
             
-            # 実行中になった場合、または実行中が続いている場合
-            if is_active:
+            # ネットワーク活動が検知された場合
+            if has_activity:
                 if not was_active:
-                    print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] プロセス実行開始を検知")
+                    print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] ネットワーク活動を検知")
                 
                 # 前回の音から10秒以上経過していれば音を鳴らす
-                if current_time - last_process_sound >= timedelta(seconds=10):
-                    print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] プロセス実行中...")
+                if current_time - last_network_sound >= timedelta(seconds=10):
+                    print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Claude通信中...")
                     sound_player.play_beeps()
-                    last_process_sound = current_time
+                    last_network_sound = current_time
             elif was_active:
-                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] プロセス実行終了")
+                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] ネットワーク活動終了")
             
-            was_active = is_active
+            was_active = has_activity
             time.sleep(3)
             
     except KeyboardInterrupt:

@@ -19,3 +19,5 @@ ENV/
 
 # Logs
 *.log
+
+.claude
