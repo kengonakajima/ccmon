@@ -1,6 +1,6 @@
 # CCMon - Claude Code Monitor
 
-CCMonは、macOS用のClaude Codeの活動状況を音で表現するモニターツールです。
+CCMonは、macOS用のClaude Codeの活動状況を、ピコピコ音で表現するモニターツールです。
 
 ## 機能
 
