@@ -43,7 +43,7 @@ class SoundPlayer:
         """指定された周波数と長さのSin波を生成（フェードアウト付き）"""
         samples = int(self.sample_rate * duration)
         t = np.linspace(0, duration, samples, False)
-        wave = 0.3 * np.sin(2 * np.pi * frequency * t)
+        wave = 0.2 * np.sin(2 * np.pi * frequency * t)
         
         # フェードアウトを追加（最後の10msをフェードアウト）
         fade_samples = int(self.sample_rate * 0.01)  # 10ms
