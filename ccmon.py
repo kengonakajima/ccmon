@@ -23,6 +23,7 @@ except ImportError:
 
 try:
     from watchdog.observers import Observer
+    from watchdog.observers.polling import PollingObserver
     from watchdog.events import FileSystemEventHandler
 except ImportError:
     print("watchdogがインストールされていません。以下のコマンドでインストールしてください:")
@@ -121,7 +122,7 @@ class ClaudeNetworkMonitor:
         self.last_bytes_received = {}
         
     def get_claude_processes(self):
-        """Claude CLIプロセスのPIDリストを取得"""
+        """Claude CLIプロセスとCodexプロセスのPIDリストを取得"""
         try:
             result = subprocess.run(
                 ['ps', 'aux'],
@@ -132,7 +133,8 @@ class ClaudeNetworkMonitor:
             
             pids = []
             for line in result.stdout.split('\n'):
-                if 'claude' in line and not 'grep' in line and not 'Claude.app' in line and not 'ccmon' in line:
+                # claude または codex プロセスを検出
+                if ('claude' in line.lower() or 'codex' in line.lower()) and not 'grep' in line and not 'Claude.app' in line and not 'ccmon' in line:
                     parts = line.split()
                     if len(parts) >= 2:
                         pids.append(parts[1])
@@ -240,47 +242,125 @@ class ClaudeProjectsHandler(FileSystemEventHandler):
         self.sound_player = sound_player
         self.last_played = datetime.now() - timedelta(seconds=10)
         
-    def on_modified(self, event):
-        """ファイルが変更されたときの処理"""
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
         if event.is_directory:
             return
             
-        # .jsonlファイルの更新のみを対象とする
+        # .jsonlファイルを対象とする
         if event.src_path.endswith('.jsonl'):
             current_time = datetime.now()
             
             # 前回の再生から10秒以上経過していれば音を鳴らす
             if current_time - self.last_played >= timedelta(seconds=10):
-                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] ファイル更新検知: {os.path.basename(event.src_path)}")
+                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Claude ファイル{event_type}検知: {os.path.basename(event.src_path)}")
                 self.sound_player.play_beeps()
                 self.last_played = current_time
+    
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+        
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+
+
+class CodexSessionsHandler(FileSystemEventHandler):
+    """Codex会話ログディレクトリの変更を監視するハンドラー"""
+    
+    def __init__(self, sound_player):
+        super().__init__()
+        self.sound_player = sound_player
+        self.last_played = datetime.now() - timedelta(seconds=10)
+        self.processed_files = set()  # 処理済みファイルを記録
+        
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
+        if event.is_directory:
+            return
+        
+        # すべてのイベントをデバッグ出力（一時的）
+        current_time = datetime.now()
+        print(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
+            
+        # .jsonまたは.jsonlファイルを対象とする
+        if event.src_path.endswith('.json') or event.src_path.endswith('.jsonl'):
+            # 新規ファイルまたは前回から10秒経過している場合
+            if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Codex ファイル{event_type}検知: {os.path.basename(event.src_path)}")
+                self.sound_player.play_beeps()
+                self.last_played = current_time
+                self.processed_files.add(event.src_path)
+        
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+        
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+    
+    def on_any_event(self, event):
+        """すべてのイベントをキャッチ（デバッグ用）"""
+        if not event.is_directory:
+            print(f"[ANY EVENT] {event.event_type}: {event.src_path}")
 
 
 def main():
     """メイン処理"""
     # 監視対象ディレクトリ
-    watch_dir = Path.home() / '.claude' / 'projects'
+    claude_watch_dir = Path.home() / '.claude' / 'projects'
+    codex_watch_dir = Path.home() / '.codex' / 'sessions'
     
-    if not watch_dir.exists():
-        print(f"エラー: {watch_dir} が存在しません。")
-        print("Claude Codeが正しくインストールされているか確認してください。")
+    # ディレクトリの存在確認
+    claude_exists = claude_watch_dir.exists()
+    codex_exists = codex_watch_dir.exists()
+    
+    if not claude_exists and not codex_exists:
+        print("エラー: Claude CodeもCodexも見つかりません。")
+        print("どちらかがインストールされているか確認してください。")
         sys.exit(1)
     
-    print("CCMon - Claude Code Monitor")
-    print(f"監視ディレクトリ: {watch_dir}")
-    print("監視項目: ファイル更新 + ネットワーク活動")
+    print("CCMon - Claude Code & Codex Monitor")
+    print("-" * 50)
+    if claude_exists:
+        print(f"✓ Claude監視ディレクトリ: {claude_watch_dir}")
+    else:
+        print(f"✗ Claude未検出: {claude_watch_dir}")
+    if codex_exists:
+        print(f"✓ Codex監視ディレクトリ: {codex_watch_dir}")
+    else:
+        print(f"✗ Codex未検出: {codex_watch_dir}")
+    print("-" * 50)
+    print("監視項目: ファイル作成/更新 + ネットワーク活動")
     print("Ctrl+Cで終了します。")
     print("-" * 50)
     
     # 音声プレイヤー、ネットワークモニター、イベントハンドラーの初期化
     sound_player = SoundPlayer()
     network_monitor = ClaudeNetworkMonitor()
-    event_handler = ClaudeProjectsHandler(sound_player)
     
     # ファイルシステム監視の開始
-    observer = Observer()
-    observer.schedule(event_handler, str(watch_dir), recursive=True)
-    observer.start()
+    # Claudeは通常のObserver、CodexはPollingObserverを使用
+    observers = []
+    
+    if claude_exists:
+        claude_observer = Observer()
+        claude_handler = ClaudeProjectsHandler(sound_player)
+        claude_observer.schedule(claude_handler, str(claude_watch_dir), recursive=True)
+        claude_observer.start()
+        observers.append(claude_observer)
+        print("Claude: 通常の監視モードで開始")
+    
+    if codex_exists:
+        # Codexはポーリング方式で監視（より確実）
+        codex_observer = PollingObserver()
+        codex_handler = CodexSessionsHandler(sound_player)
+        codex_observer.schedule(codex_handler, str(codex_watch_dir), recursive=True)
+        codex_observer.start()
+        observers.append(codex_observer)
+        print("Codex: ポーリング監視モードで開始（より確実）")
     
     # ネットワーク監視用の変数
     last_network_sound = datetime.now() - timedelta(seconds=20)
@@ -310,10 +390,12 @@ def main():
             
     except KeyboardInterrupt:
         print("\n終了します...")
-        observer.stop()
+        for observer in observers:
+            observer.stop()
         sound_player.cleanup()
     
-    observer.join()
+    for observer in observers:
+        observer.join()
     print("CCMonを終了しました。")
 
 
