@@ -1,11 +1,12 @@
-# CCMon - Claude Code Monitor
+# CCMon - Claude/Codex/Cursor Monitor
 
-CCMonは、macOS用のClaude Code/Codexの活動状況を、ピコピコ音で表現するモニターツールです。
+CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で表現するモニターツールです。
 
 ## 機能
 
 - Claude Codeの会話ログ更新を検知して音で通知（`~/.claude/projects`）
 - Codexのセッションログ更新を検知して音で通知（`~/.codex/sessions`）
+- Cursorのチャットログ更新を検知して音で通知（`~/.cursor/chats`）
 - Claudeプロセスの実行状態を監視
 - ランダムな音程でスパースな通知音を生成
 - FSEventsを使用した効率的なファイル監視
@@ -59,7 +60,8 @@ CCMonは以下の2つの活動を監視します：
 1. **ファイル監視**: 
    - Claude: `~/.claude/projects` 内の `.jsonl` 更新
    - Codex: `~/.codex/sessions` 内の `.jsonl`/`.json` 更新
-2. **プロセス監視**: `claude` コマンドの実行状態（ネットワーク活動）
+   - Cursor: `~/.cursor/chats` 内のファイル作成/更新（拡張子不問）
+2. **プロセス監視**: `claude`/`codex`/`cursor-agent` のネットワーク活動
 
 いずれかの活動を検知すると、10秒間ランダムな音程でビープ音を鳴らします。
 
