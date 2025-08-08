@@ -122,7 +122,7 @@ class ClaudeNetworkMonitor:
         self.last_bytes_received = {}
         
     def get_claude_processes(self):
-        """Claude CLIプロセスとCodexプロセスのPIDリストを取得"""
+        """Claude/Codex/Cursor エージェント系プロセスのPIDリストを取得"""
         try:
             result = subprocess.run(
                 ['ps', 'aux'],
@@ -134,7 +134,13 @@ class ClaudeNetworkMonitor:
             pids = []
             for line in result.stdout.split('\n'):
                 # claude または codex プロセスを検出
-                if ('claude' in line.lower() or 'codex' in line.lower()) and not 'grep' in line and not 'Claude.app' in line and not 'ccmon' in line:
+                # さらに cursor-agent も検出対象に含める（Cursor.app は除外）
+                lower_line = line.lower()
+                if (
+                    ('claude' in lower_line) or
+                    ('codex' in lower_line) or
+                    ('cursor-agent' in lower_line)
+                ) and ('grep' not in line) and ('Claude.app' not in line) and ('Cursor.app' not in line) and ('ccmon' not in line):
                     parts = line.split()
                     if len(parts) >= 2:
                         pids.append(parts[1])
@@ -307,22 +313,58 @@ class CodexSessionsHandler(FileSystemEventHandler):
             print(f"[ANY EVENT] {event.event_type}: {event.src_path}")
 
 
+class CursorChatsHandler(FileSystemEventHandler):
+    """Cursor会話ログディレクトリの変更を監視するハンドラー (.cursor/chats)"""
+    
+    def __init__(self, sound_player):
+        super().__init__()
+        self.sound_player = sound_player
+        self.last_played = datetime.now() - timedelta(seconds=10)
+        self.processed_files = set()
+        
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
+        if event.is_directory:
+            return
+        
+        current_time = datetime.now()
+        print(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
+        
+        # .json / .jsonl を対象
+        if event.src_path.endswith('.json') or event.src_path.endswith('.jsonl'):
+            if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Cursor ファイル{event_type}検知: {os.path.basename(event.src_path)}")
+                self.sound_player.play_beeps()
+                self.last_played = current_time
+                self.processed_files.add(event.src_path)
+    
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+        
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+
+
 def main():
     """メイン処理"""
     # 監視対象ディレクトリ
     claude_watch_dir = Path.home() / '.claude' / 'projects'
     codex_watch_dir = Path.home() / '.codex' / 'sessions'
+    cursor_watch_dir = Path.home() / '.cursor' / 'chats'
     
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
     codex_exists = codex_watch_dir.exists()
+    cursor_exists = cursor_watch_dir.exists()
     
-    if not claude_exists and not codex_exists:
-        print("エラー: Claude CodeもCodexも見つかりません。")
-        print("どちらかがインストールされているか確認してください。")
+    if not claude_exists and not codex_exists and not cursor_exists:
+        print("エラー: Claude Code / Codex / Cursor いずれも見つかりません。")
+        print("いずれかがインストールされているか確認してください。")
         sys.exit(1)
     
-    print("CCMon - Claude Code & Codex Monitor")
+    print("CCMon - Claude / Codex / Cursor Monitor")
     print("-" * 50)
     if claude_exists:
         print(f"✓ Claude監視ディレクトリ: {claude_watch_dir}")
@@ -332,6 +374,10 @@ def main():
         print(f"✓ Codex監視ディレクトリ: {codex_watch_dir}")
     else:
         print(f"✗ Codex未検出: {codex_watch_dir}")
+    if cursor_exists:
+        print(f"✓ Cursor監視ディレクトリ: {cursor_watch_dir}")
+    else:
+        print(f"✗ Cursor未検出: {cursor_watch_dir}")
     print("-" * 50)
     print("監視項目: ファイル作成/更新 + ネットワーク活動")
     print("Ctrl+Cで終了します。")
@@ -361,6 +407,15 @@ def main():
         codex_observer.start()
         observers.append(codex_observer)
         print("Codex: ポーリング監視モードで開始（より確実）")
+    
+    if cursor_exists:
+        # Cursorはポーリング方式で監視（.cursor/chats）
+        cursor_observer = PollingObserver()
+        cursor_handler = CursorChatsHandler(sound_player)
+        cursor_observer.schedule(cursor_handler, str(cursor_watch_dir), recursive=True)
+        cursor_observer.start()
+        observers.append(cursor_observer)
+        print("Cursor: ポーリング監視モードで開始（.cursor/chats）")
     
     # ネットワーク監視用の変数
     last_network_sound = datetime.now() - timedelta(seconds=20)
