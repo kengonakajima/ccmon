@@ -63,12 +63,22 @@ class SoundPlayer:
         self.stop_event.clear()
         
         def _play():
-            stream = self.pyaudio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.sample_rate,
-                output=True
-            )
+            try:
+                stream = self.pyaudio.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=self.sample_rate,
+                    output=True
+                )
+            except Exception as e:
+                # 出力デバイス問題などで失敗した場合でも状態を戻す
+                print(f"音声出力エラー: {e}")
+                # システムサウンドでのフォールバック再生
+                try:
+                    self._play_system_beeps_fallback()
+                finally:
+                    self.playing = False
+                return
             
             # ランダムな音程の範囲（Hz）
             min_freq = 400
@@ -84,7 +94,18 @@ class SoundPlayer:
                     
                     # ビープ音を生成して再生
                     beep = self.generate_beep(freq, beep_duration)
-                    stream.write(beep.tobytes())
+                    try:
+                        stream.write(beep.tobytes())
+                    except Exception as e:
+                        print(f"音声再生エラー: {e}")
+                        # ストリームが壊れた場合はフォールバックに切り替え
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception:
+                            pass
+                        self._play_system_beeps_fallback()
+                        break
                     
                     # ランダムな無音期間（0.2秒〜1.0秒）
                     silence_duration = np.random.uniform(0.2, 1.0)
@@ -94,14 +115,56 @@ class SoundPlayer:
                         break
                             
             finally:
-                stream.stop_stream()
-                stream.close()
-                self.playing = False
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                finally:
+                    self.playing = False
         
         # 別スレッドで音声再生
         thread = threading.Thread(target=_play)
         thread.daemon = True
         thread.start()
+
+    def _play_system_beeps_fallback(self):
+        """PyAudioが使えない場合にmacOSのシステムサウンドで代替再生"""
+        print("フォールバック: システムサウンドで通知します")
+        start_time = time.time()
+        end_time = start_time + 10.0
+        while time.time() < end_time and not self.stop_event.is_set():
+            played = False
+            # afplay のシステム音を試す
+            try:
+                subprocess.run(['afplay', '/System/Library/Sounds/Pop.aiff'], capture_output=True)
+                played = True
+            except Exception:
+                pass
+            # osascript beep にフォールバック
+            if not played:
+                try:
+                    subprocess.run(['osascript', '-e', 'beep'], capture_output=True)
+                    played = True
+                except Exception:
+                    pass
+            # 少し間隔を空ける
+            time.sleep(float(np.random.uniform(0.2, 0.9)))
+    
+    def play_quick_system_beep(self):
+        """短いシステムビープ（1回）を非ブロッキングで実行"""
+        def _beep_once():
+            # 可能なら afplay のシステム音、ダメなら osascript beep
+            try:
+                subprocess.run(['afplay', '/System/Library/Sounds/Pop.aiff'], capture_output=True)
+                return
+            except Exception:
+                pass
+            try:
+                subprocess.run(['osascript', '-e', 'beep'], capture_output=True)
+            except Exception:
+                pass
+        t = threading.Thread(target=_beep_once)
+        t.daemon = True
+        t.start()
     
     def stop(self):
         """音声再生を停止"""
@@ -330,13 +393,12 @@ class CursorChatsHandler(FileSystemEventHandler):
         current_time = datetime.now()
         print(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
         
-        # .json / .jsonl を対象
-        if event.src_path.endswith('.json') or event.src_path.endswith('.jsonl'):
-            if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
-                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Cursor ファイル{event_type}検知: {os.path.basename(event.src_path)}")
-                self.sound_player.play_beeps()
-                self.last_played = current_time
-                self.processed_files.add(event.src_path)
+        # 拡張子に関わらず、非ディレクトリの作成/更新で鳴らす（10秒スロットル）
+        if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+            print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Cursor ファイル{event_type}検知: {os.path.basename(event.src_path)}")
+            self.sound_player.play_beeps()
+            self.last_played = current_time
+            self.processed_files.add(event.src_path)
     
     def on_created(self, event):
         """ファイルが作成されたときの処理"""
