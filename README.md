@@ -2,6 +2,8 @@
 
 CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で表現するモニターツールです。
 
+<img width="528" height="351" alt="image" src="https://github.com/user-attachments/assets/30d72359-21d4-4a46-bc1f-beac12fb1184" />
+
 ## 機能
 
 - Claude Codeの会話ログ更新を検知して音で通知（`~/.claude/projects`）
