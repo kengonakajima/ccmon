@@ -10,9 +10,27 @@ source "$SCRIPT_DIR/venv/bin/activate"
 # 無限ループで30秒ごとに再起動
 while true; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] CCMonを起動します..."
-    
-    # CCMonを30秒間実行（タイムアウト付き、フォアグラウンドで実行）
-    timeout --foreground 30 python3 "$SCRIPT_DIR/ccmon.py"
+
+    # タイムアウトコマンド検出（macOSは通常gtimeoutが必要）
+    TIMEOUT_CMD=""
+    FOREGROUND_FLAG=""
+    if command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="gtimeout"
+        FOREGROUND_FLAG="--foreground"
+    elif command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="timeout"
+        # 一部のtimeoutは --foreground 非対応
+        if $TIMEOUT_CMD --help 2>&1 | grep -q -- "--foreground"; then
+            FOREGROUND_FLAG="--foreground"
+        fi
+    fi
+
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD $FOREGROUND_FLAG 30 python3 "$SCRIPT_DIR/ccmon.py"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] timeoutコマンドが見つかりません。制限なしで起動します（Ctrl+Cで終了）。"
+        python3 "$SCRIPT_DIR/ccmon.py"
+    fi
     
     # 終了コードを確認
     EXIT_CODE=$?
