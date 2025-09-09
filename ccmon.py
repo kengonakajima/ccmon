@@ -5,6 +5,7 @@ macOS用のClaude Codeの活動状況を音で表現するモニターツール
 """
 
 import os
+import json
 import sys
 import time
 import threading
@@ -30,6 +31,53 @@ DEBUG_MODE = str(os.environ.get("CCMON_DEBUG", "")).lower() not in ("", "0", "fa
 def dprint(*args, **kwargs):
     if DEBUG_MODE:
         print(*args, **kwargs)
+
+# 設定ファイルの永続化（~/.ccmon/settings.json）
+CONFIG_DIR = Path.home() / ".ccmon"
+CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+def _load_config() -> dict:
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        dprint(f"設定読み込みエラー: {e}")
+    return {}
+
+def _save_config(cfg: dict) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dprint(f"設定保存エラー: {e}")
+
+def load_sound_enabled() -> bool:
+    cfg = _load_config()
+    val = cfg.get("sound_enabled")
+    return bool(val) if isinstance(val, bool) else True
+
+def save_sound_enabled(enabled: bool) -> None:
+    cfg = _load_config()
+    cfg["sound_enabled"] = bool(enabled)
+    _save_config(cfg)
+
+def load_volume_level() -> int:
+    cfg = _load_config()
+    val = cfg.get("volume_level")
+    try:
+        lvl = int(val)
+    except Exception:
+        return 2
+    return max(0, min(3, lvl))
+
+def save_volume_level(level: int) -> None:
+    cfg = _load_config()
+    cfg["volume_level"] = max(0, min(3, int(level)))
+    _save_config(cfg)
 
 try:
     import pyaudio  # type: ignore
@@ -687,6 +735,17 @@ def main():
     
     # 音声プレイヤー、ネットワークモニター、イベントハンドラーの初期化
     sound_player = SoundPlayer()
+    # 起動時にサウンドON/OFFと音量を復元
+    try:
+        sound_player.enabled = load_sound_enabled()
+    except Exception:
+        # 読み込みに失敗した場合は既定のONを維持
+        pass
+    try:
+        sound_player.volume_level = load_volume_level()
+    except Exception:
+        # 読み込みに失敗した場合は既定(2)を維持
+        pass
     network_monitor = ClaudeNetworkMonitor()
     activity_tracker = ActivityTracker(window_seconds=10)
     
@@ -771,12 +830,16 @@ def main():
                             # 右に動く = 表示上で右(3 2 1 0)へ → 値は減少
                             if key == 'SPACE' or key == 'RIGHT':
                                 sound_player.volume_level = (sound_player.volume_level - 1) % 4
+                                save_volume_level(sound_player.volume_level)
                             elif key == 'LEFT':
                                 sound_player.volume_level = (sound_player.volume_level + 1) % 4
+                                save_volume_level(sound_player.volume_level)
                             elif key == 'TOGGLE':
                                 sound_player.enabled = not sound_player.enabled
                                 if not sound_player.enabled:
                                     sound_player.stop()
+                                # トグルのたびにON/OFFを保存
+                                save_sound_enabled(sound_player.enabled)
                             elif key == 'QUIT':
                                 raise KeyboardInterrupt
 
