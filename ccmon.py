@@ -13,7 +13,7 @@ import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 # Rich: TUI 表示（必須）。無い場合はエラー終了
 try:
@@ -102,11 +102,12 @@ class SoundPlayer:
     
     def __init__(self):
         self._pyaudio: Optional["pyaudio.PyAudio"] = None
+        self._pyaudio_lock = threading.Lock()
+        self._default_device_index: Optional[int] = None
+        self._default_device_name: Optional[str] = None
+        self._last_device_probe = 0.0
         if pyaudio is not None:
-            try:
-                self._pyaudio = pyaudio.PyAudio()  # type: ignore
-            except Exception:
-                self._pyaudio = None
+            self._initialize_pyaudio()
         self.sample_rate = 44100
         self.playing = False
         self.stop_event = threading.Event()
@@ -115,6 +116,128 @@ class SoundPlayer:
         # サウンド有効/無効
         self._enabled = True
         self._lock = threading.Lock()
+
+    def _initialize_pyaudio(self) -> None:
+        """PyAudioインスタンスを生成し既定出力デバイスを記録する。"""
+        if pyaudio is None:
+            return
+        with self._pyaudio_lock:
+            self._terminate_pyaudio_locked()
+            try:
+                instance = pyaudio.PyAudio()  # type: ignore
+                index, name = self._get_default_output_device(instance)
+                self._default_device_index = index
+                self._default_device_name = name
+                self._pyaudio = instance
+                dprint(f"PyAudio初期化完了: default_device_index={self._default_device_index}, name={self._default_device_name}")
+            except Exception as e:
+                dprint(f"PyAudio初期化エラー: {e}")
+                self._pyaudio = None
+                self._default_device_index = None
+                self._default_device_name = None
+
+    def _terminate_pyaudio_locked(self) -> None:
+        if self._pyaudio is not None:
+            try:
+                self._pyaudio.terminate()
+            except Exception:
+                pass
+        self._pyaudio = None
+        self._default_device_index = None
+        self._default_device_name = None
+
+    def _invalidate_pyaudio(self) -> None:
+        if pyaudio is None:
+            return
+        with self._pyaudio_lock:
+            self._terminate_pyaudio_locked()
+
+    def _get_default_output_device(self, instance: "pyaudio.PyAudio") -> Tuple[Optional[int], Optional[str]]:  # type: ignore
+        try:
+            info = instance.get_default_output_device_info()
+        except Exception as e:
+            dprint(f"既定出力デバイス取得失敗: {e}")
+            return None, None
+        index = info.get('index')
+        name = info.get('name')
+        try:
+            idx = int(index) if index is not None else None
+        except Exception:
+            idx = None
+        if isinstance(name, str) and name:
+            name_str: Optional[str] = name
+        else:
+            name_str = None
+        return idx, name_str
+
+    def _ensure_pyaudio_ready(self) -> Optional["pyaudio.PyAudio"]:
+        if pyaudio is None:
+            return None
+        with self._pyaudio_lock:
+            if self._pyaudio is None:
+                return self._create_pyaudio_locked()
+            current_index, current_name = self._get_default_output_device(self._pyaudio)
+            if current_index is None:
+                dprint("既定出力デバイス情報を取得できませんでした。PyAudioを再初期化します。")
+                self._terminate_pyaudio_locked()
+                return self._create_pyaudio_locked()
+            if current_index != self._default_device_index:
+                dprint(f"既定出力デバイス変更を検知: {self._default_device_index} -> {current_index}")
+                self._terminate_pyaudio_locked()
+                return self._create_pyaudio_locked()
+            if current_name:
+                self._default_device_name = current_name
+            return self._pyaudio
+
+    def _maybe_update_output_device_info(self) -> None:
+        if pyaudio is None:
+            return
+        now = time.time()
+        if now - self._last_device_probe < 1.0:
+            return
+        self._last_device_probe = now
+        # 再生中はPyAudioインスタンスをなるべく触らない
+        if self.playing:
+            return
+        with self._pyaudio_lock:
+            prev_index = self._default_device_index
+            prev_name = self._default_device_name
+            self._terminate_pyaudio_locked()
+            new_instance = self._create_pyaudio_locked()
+        if new_instance is None:
+            return
+        if prev_index != self._default_device_index or prev_name != self._default_device_name:
+            dprint(f"出力デバイス変更検知: index {prev_index} -> {self._default_device_index}, name {prev_name} -> {self._default_device_name}")
+
+    def _create_pyaudio_locked(self) -> Optional["pyaudio.PyAudio"]:
+        try:
+            instance = pyaudio.PyAudio()  # type: ignore
+            index, name = self._get_default_output_device(instance)
+            self._default_device_index = index
+            self._default_device_name = name
+            self._pyaudio = instance
+            dprint(f"PyAudio再初期化: default_device_index={self._default_device_index}, name={self._default_device_name}")
+            return instance
+        except Exception as e:
+            dprint(f"PyAudio再初期化に失敗: {e}")
+            self._pyaudio = None
+            self._default_device_index = None
+            self._default_device_name = None
+            return None
+
+    def get_output_device_label(self) -> str:
+        """現在利用する出力経路のラベルを取得する。"""
+        if pyaudio is None:
+            return "システムサウンド (PyAudio未利用)"
+        self._maybe_update_output_device_info()
+        pa_instance = self._ensure_pyaudio_ready()
+        if pa_instance is None:
+            return "システムサウンド (フォールバック)"
+        with self._pyaudio_lock:
+            name = self._default_device_name
+        if name:
+            return f"PyAudio: {name}"
+        return "PyAudio: 既定出力デバイス"
 
     # 音量レベルのゲッター/セッター
     @property
@@ -176,18 +299,6 @@ class SoundPlayer:
                 return
 
             stream = None
-            if self._pyaudio is not None:
-                try:
-                    stream = self._pyaudio.open(
-                        format=pyaudio.paInt16,  # type: ignore
-                        channels=1,
-                        rate=self.sample_rate,
-                        output=True
-                    )
-                except Exception as e:
-                    # 出力デバイス問題などで失敗した場合でも状態を戻す
-                    print(f"音声出力エラー: {e}")
-                    stream = None
             
             # ランダムな音程の範囲（Hz）
             min_freq = 400
@@ -200,6 +311,29 @@ class SoundPlayer:
                 while time.time() - start_time < 10.0 and not self.stop_event.is_set():
                     if not self.enabled:
                         break
+                    if stream is None:
+                        pa_instance = self._ensure_pyaudio_ready()
+                        if pa_instance is not None:
+                            try:
+                                open_kwargs = dict(
+                                    format=pyaudio.paInt16,  # type: ignore
+                                    channels=1,
+                                    rate=self.sample_rate,
+                                    output=True
+                                )
+                                if self._default_device_index is not None:
+                                    open_kwargs['output_device_index'] = self._default_device_index
+                                stream = pa_instance.open(**open_kwargs)
+                            except Exception as e:
+                                print(f"音声出力エラー: {e}")
+                                self._invalidate_pyaudio()
+                                stream = None
+                        if stream is None:
+                            self._play_system_beeps_fallback(single=True)
+                            silence_duration = np.random.uniform(0.2, 1.0)
+                            time.sleep(silence_duration)
+                            continue
+
                     # ランダムな周波数を生成
                     freq = np.random.randint(min_freq, max_freq)
                     
@@ -210,15 +344,18 @@ class SoundPlayer:
                             stream.write(beep.tobytes())
                         except Exception as e:
                             print(f"音声再生エラー: {e}")
-                            # ストリームが壊れた場合はフォールバックに切り替え
+                            # ストリームが壊れた場合はPyAudioを再初期化してフォールバックに切り替え
                             try:
                                 stream.stop_stream()
                                 stream.close()
                             except Exception:
                                 pass
                             stream = None
-                            self._play_system_beeps_fallback()
-                            break
+                            self._invalidate_pyaudio()
+                            self._play_system_beeps_fallback(single=True)
+                            silence_duration = np.random.uniform(0.2, 1.0)
+                            time.sleep(silence_duration)
+                            continue
                     else:
                         # PyAudioが使えない場合はシステムサウンド
                         self._play_system_beeps_fallback(single=True)
@@ -303,11 +440,7 @@ class SoundPlayer:
     def cleanup(self):
         """PyAudioのクリーンアップ"""
         self.stop()
-        if hasattr(self, "_pyaudio") and self._pyaudio is not None:
-            try:
-                self._pyaudio.terminate()
-            except Exception:
-                pass
+        self._invalidate_pyaudio()
 
 
 class ActivityTracker:
@@ -650,7 +783,7 @@ class TerminalInput:
         return keys
 
 
-def build_ui(enabled: bool, volume_level: int, active_status: dict) -> Panel:
+def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label: str) -> Panel:
     """RichのUIを構築して返す。"""
     # 上段: On/Off ステータス
     status_text = Text()
@@ -681,12 +814,17 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict) -> Panel:
         if lvl != 0:
             vol_text.append(" ")
 
+    output_text = Text("Output: ")
+    output_text.append(output_label, style="bold")
+
     body = Text()
     body.append_text(status_text)
     body.append("\n")
     body.append_text(plat)
     body.append("\n")
     body.append_text(vol_text)
+    body.append("\n")
+    body.append_text(output_text)
     body.append("\n\n")
     body.append("[Space]/←/→: 音量  o/Enter: On/Off  q: 終了", style="italic dim")
 
@@ -819,11 +957,13 @@ def main():
             except Exception:
                 pass
             with TerminalInput() as tinput:
-                with Live(build_ui(sound_player.enabled, sound_player.volume_level, {
+                initial_status = {
                     'claude': activity_tracker.is_active('claude'),
                     'codex': activity_tracker.is_active('codex'),
                     'cursor': activity_tracker.is_active('cursor'),
-                }), refresh_per_second=10) as live:
+                }
+                initial_output_label = sound_player.get_output_device_label()
+                with Live(build_ui(sound_player.enabled, sound_player.volume_level, initial_status, initial_output_label), refresh_per_second=10) as live:
                     while True:
                         # 入力処理
                         for key in tinput.read_keys():
@@ -848,7 +988,7 @@ def main():
                             'claude': activity_tracker.is_active('claude'),
                             'codex': activity_tracker.is_active('codex'),
                             'cursor': activity_tracker.is_active('cursor'),
-                        }), refresh=True)
+                        }, sound_player.get_output_device_label()), refresh=True)
 
                         # ネットワークチェック（約3秒毎）
                         now = datetime.now()
