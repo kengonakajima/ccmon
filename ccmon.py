@@ -451,6 +451,7 @@ class ActivityTracker:
             'claude': datetime.min,
             'codex': datetime.min,
             'cursor': datetime.min,
+            'opencode': datetime.min,
         }
         self._lock = threading.Lock()
 
@@ -701,6 +702,41 @@ class CursorChatsHandler(FileSystemEventHandler):
         self._handle_file_event(event, "更新")
 
 
+class OpencodeSessionsHandler(FileSystemEventHandler):
+    """Opencode会話ログディレクトリの変更を監視するハンドラー"""
+    
+    def __init__(self, sound_player, activity_tracker: ActivityTracker):
+        super().__init__()
+        self.sound_player = sound_player
+        self.activity_tracker = activity_tracker
+        self.last_played = datetime.now() - timedelta(seconds=10)
+        self.processed_files = set()
+        
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
+        if event.is_directory:
+            return
+        
+        current_time = datetime.now()
+        dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
+        
+        # .jsonファイルを対象とする
+        if event.src_path.endswith('.json'):
+            if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+                self.sound_player.play_beeps()
+                self.last_played = current_time
+                self.processed_files.add(event.src_path)
+                self.activity_tracker.note('opencode')
+    
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+        
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+
+
 # --- 端末入力（非ブロッキング） ---
 class TerminalInput:
     """非ブロッキングでキー入力を読み取る簡易ヘルパー。
@@ -803,6 +839,8 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     token("Codex", bool(active_status.get('codex')))
     plat.append(" ")
     token("Cursor", bool(active_status.get('cursor')))
+    plat.append(" ")
+    token("Opencode", bool(active_status.get('opencode')))
 
     # 下段: Volume 3 2 1 0（現在値をハイライト）
     vol_text = Text("Volume:  ")
@@ -837,14 +875,16 @@ def main():
     claude_watch_dir = Path.home() / '.claude' / 'projects'
     codex_watch_dir = Path.home() / '.codex' / 'sessions'
     cursor_watch_dir = Path.home() / '.cursor' / 'chats'
+    opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'storage' / 'session'
     
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
     codex_exists = codex_watch_dir.exists()
     cursor_exists = cursor_watch_dir.exists()
+    opencode_exists = opencode_watch_dir.exists()
     
-    if not claude_exists and not codex_exists and not cursor_exists:
-        print("エラー: Claude Code / Codex / Cursor いずれも見つかりません。")
+    if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists:
+        print("エラー: Claude Code / Codex / Cursor / Opencode いずれも見つかりません。")
         print("いずれかがインストールされているか確認してください。")
         sys.exit(1)
     
@@ -858,11 +898,12 @@ def main():
 
     if show_start_logs:
         header_lines = [
-            "CCMon - Claude / Codex / Cursor Monitor",
+            "CCMon - Claude / Codex / Cursor / Opencode Monitor",
             "-" * 50,
             (f"✓ Claude監視ディレクトリ: {claude_watch_dir}" if claude_exists else f"✗ Claude未検出: {claude_watch_dir}"),
             (f"✓ Codex監視ディレクトリ: {codex_watch_dir}" if codex_exists else f"✗ Codex未検出: {codex_watch_dir}"),
             (f"✓ Cursor監視ディレクトリ: {cursor_watch_dir}" if cursor_exists else f"✗ Cursor未検出: {cursor_watch_dir}"),
+            (f"✓ Opencode監視ディレクトリ: {opencode_watch_dir}" if opencode_exists else f"✗ Opencode未検出: {opencode_watch_dir}"),
             "-" * 50,
             "監視項目: ファイル作成/更新 + ネットワーク活動",
             "qで終了。TUI上のヘルプも参照してください。",
@@ -926,6 +967,18 @@ def main():
         else:
             dprint("Cursor: ポーリング監視モードで開始（.cursor/chats）")
     
+    if opencode_exists:
+        # Opencodeはポーリング方式で監視
+        opencode_observer = PollingObserver()
+        opencode_handler = OpencodeSessionsHandler(sound_player, activity_tracker)
+        opencode_observer.schedule(opencode_handler, str(opencode_watch_dir), recursive=True)
+        opencode_observer.start()
+        observers.append(opencode_observer)
+        if show_start_logs:
+            print("Opencode: ポーリング監視モードで開始")
+        else:
+            dprint("Opencode: ポーリング監視モードで開始")
+    
     # ネットワーク監視用の変数
     last_network_sound = datetime.now() - timedelta(seconds=20)
     was_active = False
@@ -961,6 +1014,7 @@ def main():
                     'claude': activity_tracker.is_active('claude'),
                     'codex': activity_tracker.is_active('codex'),
                     'cursor': activity_tracker.is_active('cursor'),
+                    'opencode': activity_tracker.is_active('opencode'),
                 }
                 initial_output_label = sound_player.get_output_device_label()
                 with Live(build_ui(sound_player.enabled, sound_player.volume_level, initial_status, initial_output_label), refresh_per_second=10) as live:
@@ -988,6 +1042,7 @@ def main():
                             'claude': activity_tracker.is_active('claude'),
                             'codex': activity_tracker.is_active('codex'),
                             'cursor': activity_tracker.is_active('cursor'),
+                            'opencode': activity_tracker.is_active('opencode'),
                         }, sound_player.get_output_device_label()), refresh=True)
 
                         # ネットワークチェック（約3秒毎）
