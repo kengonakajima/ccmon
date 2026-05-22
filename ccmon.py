@@ -704,24 +704,24 @@ class CursorChatsHandler(FileSystemEventHandler):
 
 class OpencodeSessionsHandler(FileSystemEventHandler):
     """Opencode会話ログディレクトリの変更を監視するハンドラー"""
-    
+
     def __init__(self, sound_player, activity_tracker: ActivityTracker):
         super().__init__()
         self.sound_player = sound_player
         self.activity_tracker = activity_tracker
         self.last_played = datetime.now() - timedelta(seconds=10)
         self.processed_files = set()
-        
+
     def _handle_file_event(self, event, event_type):
         """ファイルイベントの共通処理"""
         if event.is_directory:
             return
-        
+
         current_time = datetime.now()
         dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
-        
-        # .jsonファイルを対象とする
-        if event.src_path.endswith('.json'):
+
+        # .logファイルを対象とする
+        if event.src_path.endswith('.log'):
             if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
                 self.sound_player.play_beeps()
                 self.last_played = current_time
@@ -875,7 +875,7 @@ def main():
     claude_watch_dir = Path.home() / '.claude' / 'projects'
     codex_watch_dir = Path.home() / '.codex' / 'sessions'
     cursor_watch_dir = Path.home() / '.cursor' / 'chats'
-    opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'storage' / 'session'
+    opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'log'
     
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
