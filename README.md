@@ -8,7 +8,7 @@ CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で
 
 - Claude Codeの会話ログ更新を検知して音で通知（`~/.claude/projects`）
 - Codexのセッションログ更新を検知して音で通知（`~/.codex/sessions`）
-- Cursorのチャットログ更新を検知して音で通知（`~/.cursor/chats`）
+- Cursorのチャットログ更新を検知して音で通知（`~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage`）
 - Claudeプロセスの実行状態を監視
 - ランダムな音程でスパースな通知音を生成
 - FSEventsを使用した効率的なファイル監視
@@ -62,7 +62,7 @@ CCMonは以下の2つの活動を監視します：
 1. **ファイル監視**: 
    - Claude: `~/.claude/projects` 内の `.jsonl` 更新
    - Codex: `~/.codex/sessions` 内の `.jsonl`/`.json` 更新
-   - Cursor: `~/.cursor/chats` 内のファイル作成/更新（拡張子不問）
+   - Cursor: `~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage` 内の `state.vscdb` / `state.vscdb-wal` 更新
 2. **プロセス監視**: `claude`/`codex`/`cursor-agent` のネットワーク活動
 
 いずれかの活動を検知すると、10秒間ランダムな音程でビープ音を鳴らします。

@@ -668,8 +668,13 @@ class CodexSessionsHandler(FileSystemEventHandler):
             dprint(f"[ANY EVENT] {event.event_type}: {event.src_path}")
 
 
+def is_cursor_storage_file(path: str) -> bool:
+    name = Path(path).name
+    return name in ("state.vscdb", "state.vscdb-wal")
+
+
 class CursorChatsHandler(FileSystemEventHandler):
-    """Cursor会話ログディレクトリの変更を監視するハンドラー (.cursor/chats)"""
+    """Cursor workspaceStorage の変更を監視するハンドラー"""
     
     def __init__(self, sound_player, activity_tracker: ActivityTracker):
         super().__init__()
@@ -686,7 +691,10 @@ class CursorChatsHandler(FileSystemEventHandler):
         current_time = datetime.now()
         dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
         
-        # 拡張子に関わらず、非ディレクトリの作成/更新で鳴らす（10秒スロットル）
+        # Cursor IDEのチャット履歴は workspaceStorage/*/state.vscdb(-wal) に保存される
+        if not is_cursor_storage_file(event.src_path):
+            return
+
         if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
             self.sound_player.play_beeps()
             self.last_played = current_time
@@ -874,13 +882,18 @@ def main():
     # 監視対象ディレクトリ
     claude_watch_dir = Path.home() / '.claude' / 'projects'
     codex_watch_dir = Path.home() / '.codex' / 'sessions'
-    cursor_watch_dir = Path.home() / '.cursor' / 'chats'
+    cursor_user_dir = Path.home() / 'Library' / 'Application Support' / 'Cursor' / 'User'
+    cursor_watch_dirs = [
+        cursor_user_dir / 'workspaceStorage',
+        cursor_user_dir / 'globalStorage',
+    ]
     opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'log'
     
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
     codex_exists = codex_watch_dir.exists()
-    cursor_exists = cursor_watch_dir.exists()
+    existing_cursor_watch_dirs = [p for p in cursor_watch_dirs if p.exists()]
+    cursor_exists = bool(existing_cursor_watch_dirs)
     opencode_exists = opencode_watch_dir.exists()
     
     if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists:
@@ -902,7 +915,7 @@ def main():
             "-" * 50,
             (f"✓ Claude監視ディレクトリ: {claude_watch_dir}" if claude_exists else f"✗ Claude未検出: {claude_watch_dir}"),
             (f"✓ Codex監視ディレクトリ: {codex_watch_dir}" if codex_exists else f"✗ Codex未検出: {codex_watch_dir}"),
-            (f"✓ Cursor監視ディレクトリ: {cursor_watch_dir}" if cursor_exists else f"✗ Cursor未検出: {cursor_watch_dir}"),
+            (f"✓ Cursor監視ディレクトリ: {', '.join(str(p) for p in existing_cursor_watch_dirs)}" if cursor_exists else f"✗ Cursor未検出: {cursor_user_dir}"),
             (f"✓ Opencode監視ディレクトリ: {opencode_watch_dir}" if opencode_exists else f"✗ Opencode未検出: {opencode_watch_dir}"),
             "-" * 50,
             "監視項目: ファイル作成/更新 + ネットワーク活動",
@@ -956,16 +969,17 @@ def main():
             dprint("Codex: ポーリング監視モードで開始（より確実）")
     
     if cursor_exists:
-        # Cursorはポーリング方式で監視（.cursor/chats）
+        # Cursorはポーリング方式で監視（workspaceStorage + globalStorage）
         cursor_observer = PollingObserver()
         cursor_handler = CursorChatsHandler(sound_player, activity_tracker)
-        cursor_observer.schedule(cursor_handler, str(cursor_watch_dir), recursive=True)
+        for cursor_watch_dir in existing_cursor_watch_dirs:
+            cursor_observer.schedule(cursor_handler, str(cursor_watch_dir), recursive=True)
         cursor_observer.start()
         observers.append(cursor_observer)
         if show_start_logs:
-            print("Cursor: ポーリング監視モードで開始（.cursor/chats）")
+            print("Cursor: ポーリング監視モードで開始（workspaceStorage + globalStorage）")
         else:
-            dprint("Cursor: ポーリング監視モードで開始（.cursor/chats）")
+            dprint("Cursor: ポーリング監視モードで開始（workspaceStorage + globalStorage）")
     
     if opencode_exists:
         # Opencodeはポーリング方式で監視

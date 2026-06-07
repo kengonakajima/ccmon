@@ -200,7 +200,8 @@
     NSString *home = NSHomeDirectory();
     NSString *claudePath = [home stringByAppendingPathComponent:@".claude/projects"];
     NSString *codexPath  = [home stringByAppendingPathComponent:@".codex/sessions"];
-    NSString *cursorPath = [home stringByAppendingPathComponent:@".cursor/chats"];
+    NSString *cursorWorkspacePath = [home stringByAppendingPathComponent:@"Library/Application Support/Cursor/User/workspaceStorage"];
+    NSString *cursorGlobalPath = [home stringByAppendingPathComponent:@"Library/Application Support/Cursor/User/globalStorage"];
 
     self.lastClaudePlayed = [NSDate dateWithTimeIntervalSinceNow:-11];
     self.lastCodexPlayed  = [NSDate dateWithTimeIntervalSinceNow:-11];
@@ -236,19 +237,33 @@
         [Logger log:CCLogLevelInfo fmt:@"Codex path not found: %@", codexPath];
     }
 
+    NSMutableArray<NSString *> *cursorPaths = [NSMutableArray array];
     isDir = NO;
-    if ([fm fileExistsAtPath:cursorPath isDirectory:&isDir] && isDir) {
+    if ([fm fileExistsAtPath:cursorWorkspacePath isDirectory:&isDir] && isDir) {
+        [cursorPaths addObject:cursorWorkspacePath];
+    }
+    isDir = NO;
+    if ([fm fileExistsAtPath:cursorGlobalPath isDirectory:&isDir] && isDir) {
+        [cursorPaths addObject:cursorGlobalPath];
+    }
+    if (cursorPaths.count > 0) {
         __weak typeof(self) weakSelf = self;
-        self.cursorWatcher = [[FileWatcher alloc] initWithPaths:@[cursorPath]
+        self.cursorWatcher = [[FileWatcher alloc] initWithPaths:cursorPaths
                                                        handler:^(NSString *path, FSEventStreamEventFlags flags) {
             if (![weakSelf shouldHandleFlags:flags]) return;
+            if (![weakSelf isCursorStorageFile:path]) return;
             [weakSelf throttleAndPlay:&_lastCursorPlayed label:@"Cursor" filePath:path];
         }];
         [self.cursorWatcher start];
-        [Logger log:CCLogLevelInfo fmt:@"Cursor watch started: %@", cursorPath];
+        [Logger log:CCLogLevelInfo fmt:@"Cursor watch started: %@", [cursorPaths componentsJoinedByString:@", "]];
     } else {
-        [Logger log:CCLogLevelInfo fmt:@"Cursor path not found: %@", cursorPath];
+        [Logger log:CCLogLevelInfo fmt:@"Cursor path not found: %@, %@", cursorWorkspacePath, cursorGlobalPath];
     }
+}
+
+- (BOOL)isCursorStorageFile:(NSString *)path {
+    NSString *name = path.lastPathComponent;
+    return [name isEqualToString:@"state.vscdb"] || [name isEqualToString:@"state.vscdb-wal"];
 }
 
 - (BOOL)shouldHandleFlags:(FSEventStreamEventFlags)flags {
