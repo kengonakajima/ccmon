@@ -468,132 +468,6 @@ class ActivityTracker:
         return (now - last) <= self.window
 
 
-class ClaudeNetworkMonitor:
-    """Claude CLIプロセスのネットワーク活動を監視するクラス"""
-    
-    def __init__(self):
-        self.last_bytes_sent = {}
-        self.last_bytes_received = {}
-        
-    def get_claude_processes(self):
-        """Claude/Codex/Cursor エージェント系プロセスのPIDリストを取得"""
-        try:
-            result = subprocess.run(
-                ['ps', 'aux'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            pids = []
-            for line in result.stdout.split('\n'):
-                # claude または codex プロセスを検出
-                # さらに cursor-agent も検出対象に含める（Cursor.app は除外）
-                lower_line = line.lower()
-                if (
-                    ('claude' in lower_line) or
-                    ('codex' in lower_line) or
-                    ('cursor-agent' in lower_line)
-                ) and ('grep' not in line) and ('Claude.app' not in line) and ('Cursor.app' not in line) and ('ccmon' not in line):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        pids.append(parts[1])
-            
-            return pids
-            
-        except Exception as e:
-            dprint(f"プロセス取得エラー: {e}")
-            return []
-    
-    def get_network_activity(self, pid):
-        """特定のプロセスのネットワーク活動を取得"""
-        try:
-            # nettopコマンドでネットワーク統計を取得
-            result = subprocess.run(
-                ['nettop', '-x', '-l', '1', '-p', pid],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            # 送受信バイト数を解析
-            for line in result.stdout.split('\n'):
-                if pid in line:
-                    # nettopの出力形式: PID ... bytes_in bytes_out
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        # 数値を見つける
-                        numbers = []
-                        for part in parts:
-                            try:
-                                # K, M, Gなどの単位を処理
-                                if part.endswith('K'):
-                                    numbers.append(float(part[:-1]) * 1024)
-                                elif part.endswith('M'):
-                                    numbers.append(float(part[:-1]) * 1024 * 1024)
-                                elif part.endswith('G'):
-                                    numbers.append(float(part[:-1]) * 1024 * 1024 * 1024)
-                                else:
-                                    try:
-                                        numbers.append(float(part))
-                                    except:
-                                        pass
-                            except:
-                                pass
-                        
-                        if len(numbers) >= 2:
-                            return numbers[-2], numbers[-1]  # bytes_in, bytes_out
-            
-            return 0, 0
-            
-        except Exception:
-            # nettopが使えない場合は、lsofでTCP接続の存在を確認
-            try:
-                result = subprocess.run(
-                    ['lsof', '-p', pid],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                
-                # TCP接続があるかチェック
-                tcp_connections = 0
-                for line in result.stdout.split('\n'):
-                    if 'TCP' in line and 'ESTABLISHED' in line:
-                        tcp_connections += 1
-                
-                # 接続があれば活動ありとみなす
-                return tcp_connections, tcp_connections
-                
-            except Exception:
-                return 0, 0
-    
-    def has_network_activity(self):
-        """Claude CLIプロセスにネットワーク活動があるかどうかを確認"""
-        pids = self.get_claude_processes()
-        
-        for pid in pids:
-            bytes_in, bytes_out = self.get_network_activity(pid)
-            
-            # 前回の値と比較
-            last_in = self.last_bytes_received.get(pid, 0)
-            last_out = self.last_bytes_sent.get(pid, 0)
-            
-            # データ転送があれば活動中
-            if bytes_in > last_in or bytes_out > last_out:
-                self.last_bytes_received[pid] = bytes_in
-                self.last_bytes_sent[pid] = bytes_out
-                return True
-            
-            # 初回またはTCP接続がある場合も活動中とみなす
-            if pid not in self.last_bytes_received and (bytes_in > 0 or bytes_out > 0):
-                self.last_bytes_received[pid] = bytes_in
-                self.last_bytes_sent[pid] = bytes_out
-                return True
-        
-        return False
-
-
 class ClaudeProjectsHandler(FileSystemEventHandler):
     """Claude Codeプロジェクトディレクトリの変更を監視するハンドラー"""
     
@@ -674,14 +548,15 @@ def is_cursor_storage_file(path: str) -> bool:
 
 
 class CursorChatsHandler(FileSystemEventHandler):
-    """Cursor workspaceStorage の変更を監視するハンドラー"""
+    """Cursor workspaceStorage/globalStorage の変更を監視するハンドラー"""
     
-    def __init__(self, sound_player, activity_tracker: ActivityTracker):
+    def __init__(self, sound_player, activity_tracker: ActivityTracker, file_sizes: Optional[dict] = None):
         super().__init__()
         self.sound_player = sound_player
         self.activity_tracker = activity_tracker
         self.last_played = datetime.now() - timedelta(seconds=10)
         self.processed_files = set()
+        self.file_sizes = file_sizes or {}
         
     def _handle_file_event(self, event, event_type):
         """ファイルイベントの共通処理"""
@@ -693,6 +568,16 @@ class CursorChatsHandler(FileSystemEventHandler):
         
         # Cursor IDEのチャット履歴は workspaceStorage/*/state.vscdb(-wal) に保存される
         if not is_cursor_storage_file(event.src_path):
+            return
+
+        try:
+            current_size = Path(event.src_path).stat().st_size
+        except FileNotFoundError:
+            return
+        previous_size = self.file_sizes.get(event.src_path)
+        self.file_sizes[event.src_path] = current_size
+        if previous_size == current_size:
+            dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] サイズ不変のCursor更新を無視: {event.src_path}")
             return
 
         if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
@@ -708,6 +593,19 @@ class CursorChatsHandler(FileSystemEventHandler):
     def on_modified(self, event):
         """ファイルが変更されたときの処理"""
         self._handle_file_event(event, "更新")
+
+
+def collect_cursor_storage_file_sizes(paths: list[Path]) -> dict:
+    file_sizes = {}
+    for root in paths:
+        for path in root.rglob('*'):
+            if not path.is_file() or not is_cursor_storage_file(str(path)):
+                continue
+            try:
+                file_sizes[str(path)] = path.stat().st_size
+            except FileNotFoundError:
+                pass
+    return file_sizes
 
 
 class OpencodeSessionsHandler(FileSystemEventHandler):
@@ -749,7 +647,7 @@ class OpencodeSessionsHandler(FileSystemEventHandler):
 class TerminalInput:
     """非ブロッキングでキー入力を読み取る簡易ヘルパー。
     Space: 次の音量
-    ←/→: 音量変更
+    ←/→/↑/↓: 音量変更
     o: On/Off トグル
     q: 終了
     """
@@ -794,19 +692,26 @@ class TerminalInput:
             while i < len(self._buffer):
                 c = self._buffer[i]
                 if c == '\x1b':  # ESC
-                    # 可能なシーケンス: ESC [ C / ESC [ D
-                    if i + 2 < len(self._buffer) and self._buffer[i+1] == '[':
+                    if i + 1 >= len(self._buffer):
+                        break
+                    prefix = self._buffer[i+1]
+                    if prefix in ('[', 'O'):
+                        if i + 2 >= len(self._buffer):
+                            break
                         code = self._buffer[i+2]
-                        if code == 'C':
+                        if code == 'A':
+                            keys.append('UP')
+                        elif code == 'B':
+                            keys.append('DOWN')
+                        elif code == 'C':
                             keys.append('RIGHT')
-                            i += 3
-                            continue
                         elif code == 'D':
                             keys.append('LEFT')
-                            i += 3
-                            continue
-                    # 未知のESC: 1文字進める
-                    i += 1
+                        elif prefix == 'O' and code == 'M':
+                            keys.append('TOGGLE')
+                        i += 3
+                        continue
+                    i += 2
                     continue
                 else:
                     if c == ' ':
@@ -822,8 +727,7 @@ class TerminalInput:
                     continue
                 i += 1
 
-            # すべて消費
-            self._buffer = ""
+            self._buffer = self._buffer[i:]
         return keys
 
 
@@ -872,7 +776,7 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     body.append("\n")
     body.append_text(output_text)
     body.append("\n\n")
-    body.append("[Space]/←/→: 音量  o/Enter: On/Off  q: 終了", style="italic dim")
+    body.append("[Space]/矢印: 音量  o/Enter: On/Off  q: 終了", style="italic dim")
 
     return Panel(body, title="CCMon", border_style="cyan")
 
@@ -918,7 +822,7 @@ def main():
             (f"✓ Cursor監視ディレクトリ: {', '.join(str(p) for p in existing_cursor_watch_dirs)}" if cursor_exists else f"✗ Cursor未検出: {cursor_user_dir}"),
             (f"✓ Opencode監視ディレクトリ: {opencode_watch_dir}" if opencode_exists else f"✗ Opencode未検出: {opencode_watch_dir}"),
             "-" * 50,
-            "監視項目: ファイル作成/更新 + ネットワーク活動",
+            "監視項目: ファイル作成/更新",
             "qで終了。TUI上のヘルプも参照してください。",
             "-" * 50,
         ]
@@ -938,7 +842,6 @@ def main():
     except Exception:
         # 読み込みに失敗した場合は既定(2)を維持
         pass
-    network_monitor = ClaudeNetworkMonitor()
     activity_tracker = ActivityTracker(window_seconds=10)
     
     # ファイルシステム監視の開始
@@ -971,7 +874,8 @@ def main():
     if cursor_exists:
         # Cursorはポーリング方式で監視（workspaceStorage + globalStorage）
         cursor_observer = PollingObserver()
-        cursor_handler = CursorChatsHandler(sound_player, activity_tracker)
+        cursor_file_sizes = collect_cursor_storage_file_sizes(existing_cursor_watch_dirs)
+        cursor_handler = CursorChatsHandler(sound_player, activity_tracker, cursor_file_sizes)
         for cursor_watch_dir in existing_cursor_watch_dirs:
             cursor_observer.schedule(cursor_handler, str(cursor_watch_dir), recursive=True)
         cursor_observer.start()
@@ -993,29 +897,7 @@ def main():
         else:
             dprint("Opencode: ポーリング監視モードで開始")
     
-    # ネットワーク監視用の変数
-    last_network_sound = datetime.now() - timedelta(seconds=20)
-    was_active = False
-    
-    # Rich Live を使ってTUIを更新（なければ従来ループ）
-    def loop_step(now: datetime):
-        nonlocal was_active, last_network_sound
-        has_activity = network_monitor.has_network_activity()
-        # ネットワーク活動が検知された場合
-        if has_activity:
-            if not was_active:
-                dprint(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] ネットワーク活動を検知")
-            # 前回の音から10秒以上経過していれば音を鳴らす
-            if now - last_network_sound >= timedelta(seconds=10):
-                dprint(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Claude通信中...")
-                sound_player.play_beeps()
-                last_network_sound = now
-        elif was_active:
-            dprint(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] ネットワーク活動終了")
-        was_active = has_activity
-
     refresh_interval = 0.05
-    last_net_check = time.time() - 3.0
     try:
         if use_tui:
             # 余計な起動ログを隠すために画面をクリア
@@ -1036,10 +918,10 @@ def main():
                         # 入力処理
                         for key in tinput.read_keys():
                             # 右に動く = 表示上で右(3 2 1 0)へ → 値は減少
-                            if key == 'SPACE' or key == 'RIGHT':
+                            if key == 'SPACE' or key == 'RIGHT' or key == 'DOWN':
                                 sound_player.volume_level = (sound_player.volume_level - 1) % 4
                                 save_volume_level(sound_player.volume_level)
-                            elif key == 'LEFT':
+                            elif key == 'LEFT' or key == 'UP':
                                 sound_player.volume_level = (sound_player.volume_level + 1) % 4
                                 save_volume_level(sound_player.volume_level)
                             elif key == 'TOGGLE':
@@ -1059,19 +941,11 @@ def main():
                             'opencode': activity_tracker.is_active('opencode'),
                         }, sound_player.get_output_device_label()), refresh=True)
 
-                        # ネットワークチェック（約3秒毎）
-                        now = datetime.now()
-                        if time.time() - last_net_check >= 3.0:
-                            loop_step(now)
-                            last_net_check = time.time()
-
                         time.sleep(refresh_interval)
         else:
             # TTYでない: TUIを無効化。端末から直接実行するよう案内。
             print("(TTYでないためTUIを無効化しました。端末から直接実行してください)")
             while True:
-                now = datetime.now()
-                loop_step(now)
                 time.sleep(3)
     except KeyboardInterrupt:
         print("\n終了します...")
