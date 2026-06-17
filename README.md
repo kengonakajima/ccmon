@@ -1,6 +1,6 @@
-# CCMon - Claude/Codex/Cursor Monitor
+# CCMon - Claude/Codex/Cursor/Kimi Monitor
 
-CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で表現するモニターツールです。
+CCMonは、macOS用のClaude/Codex/Cursor/Kimiの活動状況を、ピコピコ音で表現するモニターツールです。
 
 <img width="514" height="137" alt="image" src="https://github.com/user-attachments/assets/a6b8c6e6-5a6f-4563-b032-02324d271634" />
 
@@ -9,6 +9,7 @@ CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で
 - Claude Codeの会話ログ更新を検知して音で通知（`~/.claude/projects`）
 - Codexのセッションログ更新を検知して音で通知（`~/.codex/sessions`）
 - Cursorのチャットログ更新を検知して音で通知（`~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage`）
+- Kimi Codeのセッションログ更新を検知して音で通知（`~/.kimi-code/sessions`）
 - ランダムな音程でスパースな通知音を生成
 - FSEventsを使用した効率的なファイル監視
 
@@ -17,7 +18,7 @@ CCMonは、macOS用のClaude/Codex/Cursorの活動状況を、ピコピコ音で
 - macOS
 - Python 3.6以上
 - PortAudio（PyAudioの依存）
-- Claude Code CLIがインストール済み
+- Claude Code / Codex / Cursor / Opencode / Kimi Code CLI のいずれかがインストール済み
 
 ## インストール
 
@@ -62,6 +63,7 @@ CCMonは以下の活動を監視します：
   - Claude: `~/.claude/projects` 内の `.jsonl` 更新
   - Codex: `~/.codex/sessions` 内の `.jsonl`/`.json` 更新
   - Cursor: `~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage` 内の `state.vscdb` / `state.vscdb-wal` 更新
+  - Kimi: `~/.kimi-code/sessions` 内の `.jsonl` 更新
 
 いずれかの活動を検知すると、10秒間ランダムな音程でビープ音を鳴らします。
 

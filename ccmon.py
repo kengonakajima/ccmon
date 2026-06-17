@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CCMon - Claude Code Monitor
-macOS用のClaude Codeの活動状況を音で表現するモニターツール
+CCMon - Claude/Codex/Cursor/Opencode/Kimi Monitor
+macOS用のコーディングエージェントの活動状況を音で表現するモニターツール
 """
 
 import os
@@ -452,6 +452,7 @@ class ActivityTracker:
             'codex': datetime.min,
             'cursor': datetime.min,
             'opencode': datetime.min,
+            'kimi': datetime.min,
         }
         self._lock = threading.Lock()
 
@@ -643,6 +644,41 @@ class OpencodeSessionsHandler(FileSystemEventHandler):
         self._handle_file_event(event, "更新")
 
 
+class KimiCodeSessionsHandler(FileSystemEventHandler):
+    """Kimi Code 会話ログディレクトリの変更を監視するハンドラー"""
+
+    def __init__(self, sound_player, activity_tracker: ActivityTracker):
+        super().__init__()
+        self.sound_player = sound_player
+        self.activity_tracker = activity_tracker
+        self.last_played = datetime.now() - timedelta(seconds=10)
+        self.processed_files = set()
+
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
+        if event.is_directory:
+            return
+
+        current_time = datetime.now()
+        dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
+
+        # .jsonlファイルを対象とする
+        if event.src_path.endswith('.jsonl'):
+            if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+                self.sound_player.play_beeps()
+                self.last_played = current_time
+                self.processed_files.add(event.src_path)
+                self.activity_tracker.note('kimi')
+
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+
+
 # --- 端末入力（非ブロッキング） ---
 class TerminalInput:
     """非ブロッキングでキー入力を読み取る簡易ヘルパー。
@@ -753,6 +789,8 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     token("Cursor", bool(active_status.get('cursor')))
     plat.append(" ")
     token("Opencode", bool(active_status.get('opencode')))
+    plat.append(" ")
+    token("Kimi", bool(active_status.get('kimi')))
 
     # 下段: Volume 3 2 1 0（現在値をハイライト）
     vol_text = Text("Volume:  ")
@@ -792,16 +830,18 @@ def main():
         cursor_user_dir / 'globalStorage',
     ]
     opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'log'
-    
+    kimi_watch_dir = Path.home() / '.kimi-code' / 'sessions'
+
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
     codex_exists = codex_watch_dir.exists()
     existing_cursor_watch_dirs = [p for p in cursor_watch_dirs if p.exists()]
     cursor_exists = bool(existing_cursor_watch_dirs)
     opencode_exists = opencode_watch_dir.exists()
-    
-    if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists:
-        print("エラー: Claude Code / Codex / Cursor / Opencode いずれも見つかりません。")
+    kimi_exists = kimi_watch_dir.exists()
+
+    if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists and not kimi_exists:
+        print("エラー: Claude Code / Codex / Cursor / Opencode / Kimi Code いずれも見つかりません。")
         print("いずれかがインストールされているか確認してください。")
         sys.exit(1)
     
@@ -815,12 +855,13 @@ def main():
 
     if show_start_logs:
         header_lines = [
-            "CCMon - Claude / Codex / Cursor / Opencode Monitor",
+            "CCMon - Claude / Codex / Cursor / Opencode / Kimi Monitor",
             "-" * 50,
             (f"✓ Claude監視ディレクトリ: {claude_watch_dir}" if claude_exists else f"✗ Claude未検出: {claude_watch_dir}"),
             (f"✓ Codex監視ディレクトリ: {codex_watch_dir}" if codex_exists else f"✗ Codex未検出: {codex_watch_dir}"),
             (f"✓ Cursor監視ディレクトリ: {', '.join(str(p) for p in existing_cursor_watch_dirs)}" if cursor_exists else f"✗ Cursor未検出: {cursor_user_dir}"),
             (f"✓ Opencode監視ディレクトリ: {opencode_watch_dir}" if opencode_exists else f"✗ Opencode未検出: {opencode_watch_dir}"),
+            (f"✓ Kimi監視ディレクトリ: {kimi_watch_dir}" if kimi_exists else f"✗ Kimi未検出: {kimi_watch_dir}"),
             "-" * 50,
             "監視項目: ファイル作成/更新",
             "qで終了。TUI上のヘルプも参照してください。",
@@ -896,7 +937,19 @@ def main():
             print("Opencode: ポーリング監視モードで開始")
         else:
             dprint("Opencode: ポーリング監視モードで開始")
-    
+
+    if kimi_exists:
+        # Kimi Codeはポーリング方式で監視
+        kimi_observer = PollingObserver()
+        kimi_handler = KimiCodeSessionsHandler(sound_player, activity_tracker)
+        kimi_observer.schedule(kimi_handler, str(kimi_watch_dir), recursive=True)
+        kimi_observer.start()
+        observers.append(kimi_observer)
+        if show_start_logs:
+            print("Kimi: ポーリング監視モードで開始")
+        else:
+            dprint("Kimi: ポーリング監視モードで開始")
+
     refresh_interval = 0.05
     try:
         if use_tui:
@@ -911,6 +964,7 @@ def main():
                     'codex': activity_tracker.is_active('codex'),
                     'cursor': activity_tracker.is_active('cursor'),
                     'opencode': activity_tracker.is_active('opencode'),
+                    'kimi': activity_tracker.is_active('kimi'),
                 }
                 initial_output_label = sound_player.get_output_device_label()
                 with Live(build_ui(sound_player.enabled, sound_player.volume_level, initial_status, initial_output_label), refresh_per_second=10) as live:
@@ -939,6 +993,7 @@ def main():
                             'codex': activity_tracker.is_active('codex'),
                             'cursor': activity_tracker.is_active('cursor'),
                             'opencode': activity_tracker.is_active('opencode'),
+                            'kimi': activity_tracker.is_active('kimi'),
                         }, sound_player.get_output_device_label()), refresh=True)
 
                         time.sleep(refresh_interval)
