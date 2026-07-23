@@ -97,6 +97,10 @@ except ImportError:
     sys.exit(1)
 
 
+# 入力待ち通知用の猫の鳴き声（効果音ラボ https://soundeffect-lab.info/）
+NEKO_SOUND_FILE = Path(__file__).resolve().parent / 'sounds' / 'neko.mp3'
+
+
 class SoundPlayer:
     """Sin波による音声生成と再生を管理するクラス"""
     
@@ -116,6 +120,8 @@ class SoundPlayer:
         # サウンド有効/無効
         self._enabled = True
         self._lock = threading.Lock()
+        # neko音の最終再生時刻（連続再生の抑制用）
+        self._last_neko_time = 0.0
 
     def _initialize_pyaudio(self) -> None:
         """PyAudioインスタンスを生成し既定出力デバイスを記録する。"""
@@ -432,6 +438,27 @@ class SoundPlayer:
         t.daemon = True
         t.start()
     
+    def play_neko(self):
+        """入力待ち通知の猫の鳴き声を1回再生（非ブロッキング、最低5秒間隔）"""
+        if not self.enabled:
+            return
+        vol_level = self.volume_level
+        if vol_level <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            if now - self._last_neko_time < 5.0:
+                return
+            self._last_neko_time = now
+
+        def _play():
+            subprocess.run(
+                ['afplay', '-v', str(vol_level / 3.0), str(NEKO_SOUND_FILE)],
+                capture_output=True)
+        t = threading.Thread(target=_play)
+        t.daemon = True
+        t.start()
+
     def stop(self):
         """音声再生を停止"""
         self.stop_event.set()
@@ -469,6 +496,70 @@ class ActivityTracker:
         return (now - last) <= self.window
 
 
+def read_last_jsonl_line(path: str) -> Optional[str]:
+    """ファイル末尾の最後の非空行を読む（書き込み途中のファイルでも安全に）。"""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return None
+            read_size = min(size, 65536)
+            f.seek(size - read_size)
+            data = f.read(read_size)
+    except OSError:
+        return None
+    lines = [ln for ln in data.split(b'\n') if ln.strip()]
+    if not lines:
+        return None
+    return lines[-1].decode('utf-8', errors='ignore')
+
+
+def detect_claude_waiting(path: str) -> Optional[str]:
+    """Claude Codeのセッションログが「入力待ち」状態かを判定する。
+    最終行が stop_reason=end_turn のassistantメッセージ（ターン完了）、
+    または AskUserQuestion のtool_use（質問中）なら、その識別子を返す。
+    それ以外は None。
+    """
+    line = read_last_jsonl_line(path)
+    if not line:
+        return None
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get('type') != 'assistant':
+        return None
+    message = d.get('message') or {}
+    content = message.get('content')
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'AskUserQuestion':
+                return f"ask:{block.get('id')}"
+    if message.get('stop_reason') == 'end_turn':
+        return f"end:{message.get('id') or d.get('uuid')}"
+    return None
+
+
+def detect_codex_waiting(path: str) -> Optional[str]:
+    """Codexのセッションログが「ターン完了（入力待ち）」状態かを判定する。
+    最終行が task_complete の event_msg なら turn_id を返す。それ以外は None。
+    """
+    line = read_last_jsonl_line(path)
+    if not line:
+        return None
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get('type') != 'event_msg':
+        return None
+    payload = d.get('payload') or {}
+    if payload.get('type') == 'task_complete':
+        return f"task:{payload.get('turn_id')}"
+    return None
+
+
 class ClaudeProjectsHandler(FileSystemEventHandler):
     """Claude Codeプロジェクトディレクトリの変更を監視するハンドラー"""
     
@@ -477,16 +568,27 @@ class ClaudeProjectsHandler(FileSystemEventHandler):
         self.sound_player = sound_player
         self.activity_tracker = activity_tracker
         self.last_played = datetime.now() - timedelta(seconds=10)
-        
+        self.last_waiting_marker = None
+
     def _handle_file_event(self, event, event_type):
         """ファイルイベントの共通処理"""
         if event.is_directory:
             return
-            
+
         # .jsonlファイルを対象とする
         if event.src_path.endswith('.jsonl'):
             current_time = datetime.now()
-            
+
+            # 入力待ち状態（ターン完了 or 質問中）ならピコピコを止めてneko音を鳴らす
+            waiting_marker = detect_claude_waiting(event.src_path)
+            if waiting_marker is not None:
+                self.activity_tracker.note('claude')
+                if waiting_marker != self.last_waiting_marker:
+                    self.last_waiting_marker = waiting_marker
+                    self.sound_player.stop()
+                    self.sound_player.play_neko()
+                return
+
             # 前回の再生から10秒以上経過していれば音を鳴らす
             if current_time - self.last_played >= timedelta(seconds=10):
                 self.sound_player.play_beeps()
@@ -511,17 +613,29 @@ class CodexSessionsHandler(FileSystemEventHandler):
         self.activity_tracker = activity_tracker
         self.last_played = datetime.now() - timedelta(seconds=10)
         self.processed_files = set()  # 処理済みファイルを記録
-        
+        self.last_waiting_marker = None
+
     def _handle_file_event(self, event, event_type):
         """ファイルイベントの共通処理"""
         if event.is_directory:
             return
-        
+
         current_time = datetime.now()
         dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
-            
+
         # .jsonまたは.jsonlファイルを対象とする
         if event.src_path.endswith('.json') or event.src_path.endswith('.jsonl'):
+            # 入力待ち状態（ターン完了）ならピコピコを止めてneko音を鳴らす
+            if event.src_path.endswith('.jsonl'):
+                waiting_marker = detect_codex_waiting(event.src_path)
+                if waiting_marker is not None:
+                    self.activity_tracker.note('codex')
+                    if waiting_marker != self.last_waiting_marker:
+                        self.last_waiting_marker = waiting_marker
+                        self.sound_player.stop()
+                        self.sound_player.play_neko()
+                    return
+
             # 新規ファイルまたは前回から10秒経過している場合
             if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
                 self.sound_player.play_beeps()
