@@ -101,6 +101,13 @@ except ImportError:
 NEKO_SOUND_FILE = Path(__file__).resolve().parent / 'sounds' / 'neko.mp3'
 
 
+def create_observer(*, polling=False):
+    """OS通知が届かない監視対象はポーリングを使う。"""
+    if polling or os.environ.get('CCMON_POLLING', '').lower() in ('1', 'true', 'yes'):
+        return PollingObserver()
+    return Observer()
+
+
 class SoundPlayer:
     """Sin波による音声生成と再生を管理するクラス"""
     
@@ -495,6 +502,12 @@ class ActivityTracker:
             last = self._last.get(name, datetime.min)
         return (now - last) <= self.window
 
+    def snapshot(self) -> dict:
+        now = datetime.now()
+        with self._lock:
+            return {name: (now - last) <= self.window
+                    for name, last in self._last.items()}
+
 
 def read_last_jsonl_line(path: str) -> Optional[str]:
     """ファイル末尾の最後の非空行を読む（書き込み途中のファイルでも安全に）。"""
@@ -543,7 +556,8 @@ def detect_claude_waiting(path: str) -> Optional[str]:
 
 def detect_codex_waiting(path: str) -> Optional[str]:
     """Codexのセッションログが「ターン完了（入力待ち）」状態かを判定する。
-    最終行が task_complete の event_msg なら turn_id を返す。それ以外は None。
+    本体のセッションで、最終行が task_complete の event_msg なら turn_id を返す。
+    補助エージェントの完了はユーザーの入力待ちではないため通知しない。
     """
     line = read_last_jsonl_line(path)
     if not line:
@@ -554,10 +568,30 @@ def detect_codex_waiting(path: str) -> Optional[str]:
         return None
     if not isinstance(d, dict) or d.get('type') != 'event_msg':
         return None
-    payload = d.get('payload') or {}
-    if payload.get('type') == 'task_complete':
-        return f"task:{payload.get('turn_id')}"
-    return None
+    payload = d.get('payload')
+    if not isinstance(payload, dict) or payload.get('type') != 'task_complete':
+        return None
+    turn_id = payload.get('turn_id')
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+
+    # sessions配下にはguardian等の内部セッションも保存される。
+    # 先頭のsession_metaを確認し、sourceがオブジェクトのsubagentを除外する。
+    # 作成途中などでメタデータを読めない場合も、完了と推測しない。
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            metadata = json.loads(f.readline())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(metadata, dict) or metadata.get('type') != 'session_meta':
+        return None
+    session = metadata.get('payload')
+    if not isinstance(session, dict):
+        return None
+    source = session.get('source')
+    if not isinstance(source, str) or not source or source == 'subagent':
+        return None
+    return f"task:{turn_id}"
 
 
 class ClaudeProjectsHandler(FileSystemEventHandler):
@@ -613,7 +647,7 @@ class CodexSessionsHandler(FileSystemEventHandler):
         self.activity_tracker = activity_tracker
         self.last_played = datetime.now() - timedelta(seconds=10)
         self.processed_files = set()  # 処理済みファイルを記録
-        self.last_waiting_marker = None
+        self.last_waiting_markers = {}  # セッションごとに通知済みターンを記録
 
     def _handle_file_event(self, event, event_type):
         """ファイルイベントの共通処理"""
@@ -630,8 +664,8 @@ class CodexSessionsHandler(FileSystemEventHandler):
                 waiting_marker = detect_codex_waiting(event.src_path)
                 if waiting_marker is not None:
                     self.activity_tracker.note('codex')
-                    if waiting_marker != self.last_waiting_marker:
-                        self.last_waiting_marker = waiting_marker
+                    if waiting_marker != self.last_waiting_markers.get(event.src_path):
+                        self.last_waiting_markers[event.src_path] = waiting_marker
                         self.sound_player.stop()
                         self.sound_player.play_neko()
                     return
@@ -933,6 +967,44 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     return Panel(body, title="CCMon", border_style="cyan")
 
 
+def run_tui(console, sound_player, activity_tracker):
+    """キー入力を確認し、状態や端末サイズが変わった時だけ再描画する。"""
+    def ui_state():
+        return (sound_player.enabled, sound_player.volume_level,
+                activity_tracker.snapshot(), sound_player.get_output_device_label(),
+                console.size)
+
+    try:
+        console.clear()
+    except Exception:
+        pass
+    with TerminalInput() as tinput:
+        previous_state = ui_state()
+        with Live(build_ui(*previous_state[:4]), console=console, auto_refresh=False) as live:
+            while True:
+                for key in tinput.read_keys():
+                    # 右に動く = 表示上で右(3 2 1 0)へ → 値は減少
+                    if key in ('SPACE', 'RIGHT', 'DOWN'):
+                        sound_player.volume_level = (sound_player.volume_level - 1) % 4
+                        save_volume_level(sound_player.volume_level)
+                    elif key in ('LEFT', 'UP'):
+                        sound_player.volume_level = (sound_player.volume_level + 1) % 4
+                        save_volume_level(sound_player.volume_level)
+                    elif key == 'TOGGLE':
+                        sound_player.enabled = not sound_player.enabled
+                        if not sound_player.enabled:
+                            sound_player.stop()
+                        save_sound_enabled(sound_player.enabled)
+                    elif key == 'QUIT':
+                        raise KeyboardInterrupt
+
+                current_state = ui_state()
+                if current_state != previous_state:
+                    live.update(build_ui(*current_state[:4]), refresh=True)
+                    previous_state = current_state
+                time.sleep(0.1)
+
+
 def main():
     """メイン処理"""
     # 監視対象ディレクトリ
@@ -1000,35 +1072,36 @@ def main():
     activity_tracker = ActivityTracker(window_seconds=10)
     
     # ファイルシステム監視の開始
-    # Claudeは通常のObserver、CodexはPollingObserverを使用
+    # Codex以外はOSの変更通知でアイドル中の全ファイル走査を避ける
     observers = []
     
     if claude_exists:
-        claude_observer = Observer()
+        claude_observer = create_observer()
         claude_handler = ClaudeProjectsHandler(sound_player, activity_tracker)
         claude_observer.schedule(claude_handler, str(claude_watch_dir), recursive=True)
         claude_observer.start()
         observers.append(claude_observer)
         if show_start_logs:
-            print("Claude: 通常の監視モードで開始")
+            print(f"Claude: {type(claude_observer).__name__}で監視開始")
         else:
-            dprint("Claude: 通常の監視モードで開始")
+            dprint(f"Claude: {type(claude_observer).__name__}で監視開始")
     
     if codex_exists:
-        # Codexはポーリング方式で監視（より確実）
-        codex_observer = PollingObserver()
+        # Codex Desktopの実ログ追記はFSEventsで通知されない場合がある。
+        # ファイルの作成・追記を確実に拾うため、この監視だけ毎秒ポーリングする。
+        codex_observer = create_observer(polling=True)
         codex_handler = CodexSessionsHandler(sound_player, activity_tracker)
         codex_observer.schedule(codex_handler, str(codex_watch_dir), recursive=True)
         codex_observer.start()
         observers.append(codex_observer)
         if show_start_logs:
-            print("Codex: ポーリング監視モードで開始（より確実）")
+            print(f"Codex: {type(codex_observer).__name__}で監視開始")
         else:
-            dprint("Codex: ポーリング監視モードで開始（より確実）")
+            dprint(f"Codex: {type(codex_observer).__name__}で監視開始")
     
     if cursor_exists:
-        # Cursorはポーリング方式で監視（workspaceStorage + globalStorage）
-        cursor_observer = PollingObserver()
+        # workspaceStorage + globalStorageを監視
+        cursor_observer = create_observer()
         cursor_file_sizes = collect_cursor_storage_file_sizes(existing_cursor_watch_dirs)
         cursor_handler = CursorChatsHandler(sound_player, activity_tracker, cursor_file_sizes)
         for cursor_watch_dir in existing_cursor_watch_dirs:
@@ -1036,81 +1109,35 @@ def main():
         cursor_observer.start()
         observers.append(cursor_observer)
         if show_start_logs:
-            print("Cursor: ポーリング監視モードで開始（workspaceStorage + globalStorage）")
+            print(f"Cursor: {type(cursor_observer).__name__}で監視開始（workspaceStorage + globalStorage）")
         else:
-            dprint("Cursor: ポーリング監視モードで開始（workspaceStorage + globalStorage）")
+            dprint(f"Cursor: {type(cursor_observer).__name__}で監視開始（workspaceStorage + globalStorage）")
     
     if opencode_exists:
-        # Opencodeはポーリング方式で監視
-        opencode_observer = PollingObserver()
+        opencode_observer = create_observer()
         opencode_handler = OpencodeSessionsHandler(sound_player, activity_tracker)
         opencode_observer.schedule(opencode_handler, str(opencode_watch_dir), recursive=True)
         opencode_observer.start()
         observers.append(opencode_observer)
         if show_start_logs:
-            print("Opencode: ポーリング監視モードで開始")
+            print(f"Opencode: {type(opencode_observer).__name__}で監視開始")
         else:
-            dprint("Opencode: ポーリング監視モードで開始")
+            dprint(f"Opencode: {type(opencode_observer).__name__}で監視開始")
 
     if kimi_exists:
-        # Kimi Codeはポーリング方式で監視
-        kimi_observer = PollingObserver()
+        kimi_observer = create_observer()
         kimi_handler = KimiCodeSessionsHandler(sound_player, activity_tracker)
         kimi_observer.schedule(kimi_handler, str(kimi_watch_dir), recursive=True)
         kimi_observer.start()
         observers.append(kimi_observer)
         if show_start_logs:
-            print("Kimi: ポーリング監視モードで開始")
+            print(f"Kimi: {type(kimi_observer).__name__}で監視開始")
         else:
-            dprint("Kimi: ポーリング監視モードで開始")
+            dprint(f"Kimi: {type(kimi_observer).__name__}で監視開始")
 
-    refresh_interval = 0.05
     try:
         if use_tui:
-            # 余計な起動ログを隠すために画面をクリア
-            try:
-                console.clear()
-            except Exception:
-                pass
-            with TerminalInput() as tinput:
-                initial_status = {
-                    'claude': activity_tracker.is_active('claude'),
-                    'codex': activity_tracker.is_active('codex'),
-                    'cursor': activity_tracker.is_active('cursor'),
-                    'opencode': activity_tracker.is_active('opencode'),
-                    'kimi': activity_tracker.is_active('kimi'),
-                }
-                initial_output_label = sound_player.get_output_device_label()
-                with Live(build_ui(sound_player.enabled, sound_player.volume_level, initial_status, initial_output_label), refresh_per_second=10) as live:
-                    while True:
-                        # 入力処理
-                        for key in tinput.read_keys():
-                            # 右に動く = 表示上で右(3 2 1 0)へ → 値は減少
-                            if key == 'SPACE' or key == 'RIGHT' or key == 'DOWN':
-                                sound_player.volume_level = (sound_player.volume_level - 1) % 4
-                                save_volume_level(sound_player.volume_level)
-                            elif key == 'LEFT' or key == 'UP':
-                                sound_player.volume_level = (sound_player.volume_level + 1) % 4
-                                save_volume_level(sound_player.volume_level)
-                            elif key == 'TOGGLE':
-                                sound_player.enabled = not sound_player.enabled
-                                if not sound_player.enabled:
-                                    sound_player.stop()
-                                # トグルのたびにON/OFFを保存
-                                save_sound_enabled(sound_player.enabled)
-                            elif key == 'QUIT':
-                                raise KeyboardInterrupt
-
-                        # UI更新
-                        live.update(build_ui(sound_player.enabled, sound_player.volume_level, {
-                            'claude': activity_tracker.is_active('claude'),
-                            'codex': activity_tracker.is_active('codex'),
-                            'cursor': activity_tracker.is_active('cursor'),
-                            'opencode': activity_tracker.is_active('opencode'),
-                            'kimi': activity_tracker.is_active('kimi'),
-                        }, sound_player.get_output_device_label()), refresh=True)
-
-                        time.sleep(refresh_interval)
+            run_tui(console, sound_player, activity_tracker)
         else:
             # TTYでない: TUIを無効化。端末から直接実行するよう案内。
             print("(TTYでないためTUIを無効化しました。端末から直接実行してください)")
