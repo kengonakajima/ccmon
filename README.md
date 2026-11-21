@@ -1,6 +1,6 @@
-# CCMon - Claude/Codex/Cursor/Kimi Monitor
+# CCMon - Claude/Codex/Cursor/Kimi/Agy Monitor
 
-CCMonは、macOS用のClaude/Codex/Cursor/Kimiの活動状況を、ピコピコ音で表現するモニターツールです。
+CCMonは、macOS用のClaude/Codex/Cursor/Kimi/Agyの活動状況を、ピコピコ音で表現するモニターツールです。
 
 <img width="514" height="137" alt="image" src="https://github.com/user-attachments/assets/a6b8c6e6-5a6f-4563-b032-02324d271634" />
 
@@ -10,15 +10,16 @@ CCMonは、macOS用のClaude/Codex/Cursor/Kimiの活動状況を、ピコピコ�
 - Codexのセッションログ更新を検知して音で通知（`~/.codex/sessions`）
 - Cursorのチャットログ更新を検知して音で通知（`~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage`）
 - Kimi Codeのセッションログ更新を検知して音で通知（`~/.kimi-code/sessions`）
+- Antigravity (agy) の会話ログ更新を検知して音で通知（`~/.gemini/antigravity-cli/brain` / `antigravity/brain` / `antigravity-ide/brain`）
 - ランダムな音程でスパースな通知音を生成
-- Claude Code / Codex がターン完了や質問でユーザーの入力を待っている状態になると、猫の鳴き声で通知
+- Claude Code / Codex / Agy がターン完了や質問でユーザーの入力を待っている状態になると、猫の鳴き声で通知
 - FSEventsを使用した効率的なファイル監視
 
 ## 必要要件
 
 - macOS
 - Python 3.6以上
-- Claude Code / Codex / Cursor / Opencode / Kimi Code CLI のいずれかがインストール済み
+- Claude Code / Codex / Cursor / Opencode / Kimi Code CLI / Antigravity (agy) のいずれかがインストール済み
 
 ## インストール
 
@@ -59,10 +60,11 @@ CCMonは以下の活動を監視します：
   - Codex: `~/.codex/sessions` 内の `.jsonl`/`.json` 更新
   - Cursor: `~/Library/Application Support/Cursor/User/workspaceStorage` / `globalStorage` 内の `state.vscdb` / `state.vscdb-wal` 更新
   - Kimi: `~/.kimi-code/sessions` 内の `.jsonl` 更新
+  - Agy: `~/.gemini/antigravity-cli/brain` / `~/.gemini/antigravity/brain` / `~/.gemini/antigravity-ide/brain` 内の `.system_generated/logs/transcript.jsonl` 更新
 
 いずれかの活動を検知すると、10秒間ランダムな音程でビープ音を鳴らします。
 
-また、Claude Code / Codex のログの最終行を確認し、ターンが完了してユーザーの入力を待っている状態（Claude Codeでは質問中も含む）を検知すると、ビープ音を止めて猫の鳴き声（`sounds/neko.mp3`）を1回鳴らします。
+また、Claude Code / Codex / Agy のログの最終行を確認し、ターンが完了してユーザーの入力を待っている状態（Claude Code / Agy では質問中も含む）を検知すると、ビープ音を止めて猫の鳴き声（`sounds/neko.mp3`）を1回鳴らします。
 
 Codexでは、セッション情報で本体と補助エージェントを区別し、本体のターン完了だけを猫の鳴き声で通知します。guardianなどの内部エージェントやサブエージェントの完了では鳴りません。
 

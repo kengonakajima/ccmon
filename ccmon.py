@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CCMon - Claude/Codex/Cursor/Opencode/Kimi Monitor
+CCMon - Claude/Codex/Cursor/Opencode/Kimi/Agy Monitor
 macOS用のコーディングエージェントの活動状況を音で表現するモニターツール
 """
 
@@ -332,6 +332,7 @@ class ActivityTracker:
             'cursor': datetime.min,
             'opencode': datetime.min,
             'kimi': datetime.min,
+            'agy': datetime.min,
         }
         self._lock = threading.Lock()
 
@@ -672,6 +673,93 @@ class KimiCodeSessionsHandler(FileSystemEventHandler):
         self._handle_file_event(event, "更新")
 
 
+def is_agy_transcript_file(path: str) -> bool:
+    """Antigravity (agy) の会話ログ本体かどうかを判定する。"""
+    return Path(path).parts[-3:] == ('.system_generated', 'logs', 'transcript.jsonl')
+
+
+def detect_agy_waiting(path: str) -> Optional[str]:
+    """Antigravity (agy) のセッションログが「入力待ち」状態かを判定する。
+    最終行が status=DONE の PLANNER_RESPONSE で、ask_question のtool_callを含む、
+    または tool_calls 無しで本文を返してターン完了していれば識別子を返す。
+    それ以外は None。
+    """
+    line = read_last_jsonl_line(path)
+    if not line:
+        return None
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    if d.get('type') != 'PLANNER_RESPONSE' or d.get('status') != 'DONE':
+        return None
+    step_id = d.get('step_index')
+    if step_id is None:
+        step_id = d.get('created_at')
+    if step_id is None or step_id == '':
+        return None
+    tool_calls = d.get('tool_calls')
+    if isinstance(tool_calls, list) and tool_calls:
+        for call in tool_calls:
+            if isinstance(call, dict) and call.get('name') == 'ask_question':
+                return f"ask:{step_id}"
+        return None
+    content = d.get('content')
+    if isinstance(content, str) and content.strip():
+        return f"end:{step_id}"
+    return None
+
+
+class AgySessionsHandler(FileSystemEventHandler):
+    """Antigravity (agy) 会話ログディレクトリの変更を監視するハンドラー"""
+
+    def __init__(self, sound_player, activity_tracker: ActivityTracker):
+        super().__init__()
+        self.sound_player = sound_player
+        self.activity_tracker = activity_tracker
+        self.last_played = datetime.now() - timedelta(seconds=10)
+        self.processed_files = set()
+        self.last_waiting_markers = {}  # セッションごとに通知済みターンを記録
+
+    def _handle_file_event(self, event, event_type):
+        """ファイルイベントの共通処理"""
+        if event.is_directory:
+            return
+
+        current_time = datetime.now()
+        dprint(f"[DEBUG {current_time.strftime('%H:%M:%S')}] {event_type}: {event.src_path}")
+
+        if not is_agy_transcript_file(event.src_path):
+            return
+
+        # 入力待ち状態（ターン完了 or 質問中）ならピコピコを止めてneko音を鳴らす
+        waiting_marker = detect_agy_waiting(event.src_path)
+        if waiting_marker is not None:
+            self.activity_tracker.note('agy')
+            if waiting_marker != self.last_waiting_markers.get(event.src_path):
+                self.last_waiting_markers[event.src_path] = waiting_marker
+                self.sound_player.stop()
+                self.sound_player.play_neko()
+            return
+
+        # 新規ファイルまたは前回から10秒経過している場合
+        if event.src_path not in self.processed_files or current_time - self.last_played >= timedelta(seconds=10):
+            self.sound_player.play_beeps()
+            self.last_played = current_time
+            self.processed_files.add(event.src_path)
+            self.activity_tracker.note('agy')
+
+    def on_created(self, event):
+        """ファイルが作成されたときの処理"""
+        self._handle_file_event(event, "作成")
+
+    def on_modified(self, event):
+        """ファイルが変更されたときの処理"""
+        self._handle_file_event(event, "更新")
+
+
 # --- 端末入力（非ブロッキング） ---
 class TerminalInput:
     """非ブロッキングでキー入力を読み取る簡易ヘルパー。
@@ -784,6 +872,8 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     token("Opencode", bool(active_status.get('opencode')))
     plat.append(" ")
     token("Kimi", bool(active_status.get('kimi')))
+    plat.append(" ")
+    token("Agy", bool(active_status.get('agy')))
 
     # 下段: Volume 3 2 1 0（現在値をハイライト）
     vol_text = Text("Volume:  ")
@@ -862,6 +952,12 @@ def main():
     ]
     opencode_watch_dir = Path.home() / '.local' / 'share' / 'opencode' / 'log'
     kimi_watch_dir = Path.home() / '.kimi-code' / 'sessions'
+    gemini_dir = Path.home() / '.gemini'
+    agy_watch_dirs = [
+        gemini_dir / 'antigravity-cli' / 'brain',
+        gemini_dir / 'antigravity' / 'brain',
+        gemini_dir / 'antigravity-ide' / 'brain',
+    ]
 
     # ディレクトリの存在確認
     claude_exists = claude_watch_dir.exists()
@@ -870,9 +966,11 @@ def main():
     cursor_exists = bool(existing_cursor_watch_dirs)
     opencode_exists = opencode_watch_dir.exists()
     kimi_exists = kimi_watch_dir.exists()
+    existing_agy_watch_dirs = [p for p in agy_watch_dirs if p.exists()]
+    agy_exists = bool(existing_agy_watch_dirs)
 
-    if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists and not kimi_exists:
-        print("エラー: Claude Code / Codex / Cursor / Opencode / Kimi Code いずれも見つかりません。")
+    if not claude_exists and not codex_exists and not cursor_exists and not opencode_exists and not kimi_exists and not agy_exists:
+        print("エラー: Claude Code / Codex / Cursor / Opencode / Kimi Code / Agy いずれも見つかりません。")
         print("いずれかがインストールされているか確認してください。")
         sys.exit(1)
     
@@ -886,13 +984,14 @@ def main():
 
     if show_start_logs:
         header_lines = [
-            "CCMon - Claude / Codex / Cursor / Opencode / Kimi Monitor",
+            "CCMon - Claude / Codex / Cursor / Opencode / Kimi / Agy Monitor",
             "-" * 50,
             (f"✓ Claude監視ディレクトリ: {claude_watch_dir}" if claude_exists else f"✗ Claude未検出: {claude_watch_dir}"),
             (f"✓ Codex監視ディレクトリ: {codex_watch_dir}" if codex_exists else f"✗ Codex未検出: {codex_watch_dir}"),
             (f"✓ Cursor監視ディレクトリ: {', '.join(str(p) for p in existing_cursor_watch_dirs)}" if cursor_exists else f"✗ Cursor未検出: {cursor_user_dir}"),
             (f"✓ Opencode監視ディレクトリ: {opencode_watch_dir}" if opencode_exists else f"✗ Opencode未検出: {opencode_watch_dir}"),
             (f"✓ Kimi監視ディレクトリ: {kimi_watch_dir}" if kimi_exists else f"✗ Kimi未検出: {kimi_watch_dir}"),
+            (f"✓ Agy監視ディレクトリ: {', '.join(str(p) for p in existing_agy_watch_dirs)}" if agy_exists else f"✗ Agy未検出: {gemini_dir}"),
             "-" * 50,
             "監視項目: ファイル作成/更新",
             "qで終了。TUI上のヘルプも参照してください。",
@@ -979,6 +1078,18 @@ def main():
             print(f"Kimi: {type(kimi_observer).__name__}で監視開始")
         else:
             dprint(f"Kimi: {type(kimi_observer).__name__}で監視開始")
+
+    if agy_exists:
+        agy_observer = create_observer()
+        agy_handler = AgySessionsHandler(sound_player, activity_tracker)
+        for agy_watch_dir in existing_agy_watch_dirs:
+            agy_observer.schedule(agy_handler, str(agy_watch_dir), recursive=True)
+        agy_observer.start()
+        observers.append(agy_observer)
+        if show_start_logs:
+            print(f"Agy: {type(agy_observer).__name__}で監視開始")
+        else:
+            dprint(f"Agy: {type(agy_observer).__name__}で監視開始")
 
     try:
         if use_tui:
