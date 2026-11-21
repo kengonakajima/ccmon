@@ -18,23 +18,17 @@ CCMonは、macOS用のClaude/Codex/Cursor/Kimiの活動状況を、ピコピコ�
 
 - macOS
 - Python 3.6以上
-- PortAudio（PyAudioの依存）
 - Claude Code / Codex / Cursor / Opencode / Kimi Code CLI のいずれかがインストール済み
 
 ## インストール
 
-1. PortAudioをインストール
-```bash
-brew install portaudio
-```
-
-2. リポジトリをクローン
+1. リポジトリをクローン
 ```bash
 git clone https://github.com/kengonakajima/ccmon.git
 cd ccmon
 ```
 
-3. 仮想環境を作成してパッケージをインストール
+2. 仮想環境を作成してパッケージをインストール
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -77,6 +71,9 @@ Codexは実ログの追記でmacOSの変更通知が届かない場合がある�
 
 ## 音の仕様
 
+- macOS標準の`afplay`を別プロセスで使用（PyAudio / PortAudioは不要）
+- 10秒分のビープと無音をまとめて再生し、プロセス起動による間隔の延びを防止
+- 再生は1件ずつ処理し、予定の再生時間＋5秒で終了しないプロセスは停止。次の通知で再試行（猫の声は5秒で打ち切り）
 - 周波数範囲: 400Hz〜1600Hz（ランダム）
 - ビープ音の長さ: 0.05秒
 - 無音期間: 0.2秒〜1.0秒（ランダム）

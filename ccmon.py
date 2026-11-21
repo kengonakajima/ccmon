@@ -10,10 +10,12 @@ import sys
 import time
 import threading
 import subprocess
+import tempfile
+import wave
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 
 # Rich: TUI 表示（必須）。無い場合はエラー終了
 try:
@@ -80,14 +82,6 @@ def save_volume_level(level: int) -> None:
     _save_config(cfg)
 
 try:
-    import pyaudio  # type: ignore
-except ImportError:
-    # PyAudio が未導入でもTUIを動作させ、音はシステムサウンドで代替する
-    pyaudio = None  # type: ignore
-    print("PyAudioが見つかりません。システムサウンドで代替します。")
-    print("(インストール推奨: brew install portaudio && pip3 install pyaudio)")
-
-try:
     from watchdog.observers import Observer
     from watchdog.observers.polling import PollingObserver
     from watchdog.events import FileSystemEventHandler
@@ -108,373 +102,224 @@ def create_observer(*, polling=False):
     return Observer()
 
 
+def stop_observers(observers, timeout=2.0):
+    """watchdogのstop自体も内部でjoinするため、終了待ち全体に上限を設ける。"""
+    def stop_one(observer):
+        try:
+            observer.stop()
+            observer.join(timeout=timeout)
+        except Exception as error:
+            dprint(f'監視の終了エラー: {error}')
+
+    deadline = time.monotonic() + timeout
+    threads = []
+    for observer in observers:
+        thread = threading.Thread(target=stop_one, args=(observer,), daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
 class SoundPlayer:
-    """Sin波による音声生成と再生を管理するクラス"""
-    
+    """再生要求を直列化し、音声デバイス操作はafplay子プロセスに隔離する。"""
+
+    PLAYBACK_TIMEOUT = 5.0
+    PROCESS_STOP_TIMEOUT = 0.25
+    BEEP_DURATION = 10.0
+
     def __init__(self):
-        self._pyaudio: Optional["pyaudio.PyAudio"] = None
-        self._pyaudio_lock = threading.Lock()
-        self._default_device_index: Optional[int] = None
-        self._default_device_name: Optional[str] = None
-        self._last_device_probe = 0.0
-        if pyaudio is not None:
-            self._initialize_pyaudio()
         self.sample_rate = 44100
-        self.playing = False
-        self.stop_event = threading.Event()
-        # 0,1,2,3 の4段階ボリューム（既定=2）
         self._volume_level = 2
-        # サウンド有効/無効
         self._enabled = True
-        self._lock = threading.Lock()
-        # neko音の最終再生時刻（連続再生の抑制用）
-        self._last_neko_time = 0.0
-
-    def _initialize_pyaudio(self) -> None:
-        """PyAudioインスタンスを生成し既定出力デバイスを記録する。"""
-        if pyaudio is None:
-            return
-        with self._pyaudio_lock:
-            self._terminate_pyaudio_locked()
-            try:
-                instance = pyaudio.PyAudio()  # type: ignore
-                index, name = self._get_default_output_device(instance)
-                self._default_device_index = index
-                self._default_device_name = name
-                self._pyaudio = instance
-                dprint(f"PyAudio初期化完了: default_device_index={self._default_device_index}, name={self._default_device_name}")
-            except Exception as e:
-                dprint(f"PyAudio初期化エラー: {e}")
-                self._pyaudio = None
-                self._default_device_index = None
-                self._default_device_name = None
-
-    def _terminate_pyaudio_locked(self) -> None:
-        if self._pyaudio is not None:
-            try:
-                self._pyaudio.terminate()
-            except Exception:
-                pass
-        self._pyaudio = None
-        self._default_device_index = None
-        self._default_device_name = None
-
-    def _invalidate_pyaudio(self) -> None:
-        if pyaudio is None:
-            return
-        with self._pyaudio_lock:
-            self._terminate_pyaudio_locked()
-
-    def _get_default_output_device(self, instance: "pyaudio.PyAudio") -> Tuple[Optional[int], Optional[str]]:  # type: ignore
-        try:
-            info = instance.get_default_output_device_info()
-        except Exception as e:
-            dprint(f"既定出力デバイス取得失敗: {e}")
-            return None, None
-        index = info.get('index')
-        name = info.get('name')
-        try:
-            idx = int(index) if index is not None else None
-        except Exception:
-            idx = None
-        if isinstance(name, str) and name:
-            name_str: Optional[str] = name
-        else:
-            name_str = None
-        return idx, name_str
-
-    def _ensure_pyaudio_ready(self) -> Optional["pyaudio.PyAudio"]:
-        if pyaudio is None:
-            return None
-        with self._pyaudio_lock:
-            if self._pyaudio is None:
-                return self._create_pyaudio_locked()
-            current_index, current_name = self._get_default_output_device(self._pyaudio)
-            if current_index is None:
-                dprint("既定出力デバイス情報を取得できませんでした。PyAudioを再初期化します。")
-                self._terminate_pyaudio_locked()
-                return self._create_pyaudio_locked()
-            if current_index != self._default_device_index:
-                dprint(f"既定出力デバイス変更を検知: {self._default_device_index} -> {current_index}")
-                self._terminate_pyaudio_locked()
-                return self._create_pyaudio_locked()
-            if current_name:
-                self._default_device_name = current_name
-            return self._pyaudio
-
-    def _maybe_update_output_device_info(self) -> None:
-        if pyaudio is None:
-            return
-        now = time.time()
-        if now - self._last_device_probe < 1.0:
-            return
-        self._last_device_probe = now
-        # 再生中はPyAudioインスタンスをなるべく触らない
-        if self.playing:
-            return
-        with self._pyaudio_lock:
-            prev_index = self._default_device_index
-            prev_name = self._default_device_name
-            self._terminate_pyaudio_locked()
-            new_instance = self._create_pyaudio_locked()
-        if new_instance is None:
-            return
-        if prev_index != self._default_device_index or prev_name != self._default_device_name:
-            dprint(f"出力デバイス変更検知: index {prev_index} -> {self._default_device_index}, name {prev_name} -> {self._default_device_name}")
-
-    def _create_pyaudio_locked(self) -> Optional["pyaudio.PyAudio"]:
-        try:
-            instance = pyaudio.PyAudio()  # type: ignore
-            index, name = self._get_default_output_device(instance)
-            self._default_device_index = index
-            self._default_device_name = name
-            self._pyaudio = instance
-            dprint(f"PyAudio再初期化: default_device_index={self._default_device_index}, name={self._default_device_name}")
-            return instance
-        except Exception as e:
-            dprint(f"PyAudio再初期化に失敗: {e}")
-            self._pyaudio = None
-            self._default_device_index = None
-            self._default_device_name = None
-            return None
+        self._condition = threading.Condition()
+        self._pending = None
+        self._current = None
+        self._closed = False
+        self._last_neko_time = float('-inf')
+        self._last_beep_time = float('-inf')
+        self._worker = threading.Thread(target=self._run, name='ccmon-audio', daemon=True)
+        self._worker.start()
 
     def get_output_device_label(self) -> str:
-        """現在利用する出力経路のラベルを取得する。"""
-        if pyaudio is None:
-            return "システムサウンド (PyAudio未利用)"
-        self._maybe_update_output_device_info()
-        pa_instance = self._ensure_pyaudio_ready()
-        if pa_instance is None:
-            return "システムサウンド (フォールバック)"
-        with self._pyaudio_lock:
-            name = self._default_device_name
-        if name:
-            return f"PyAudio: {name}"
-        return "PyAudio: 既定出力デバイス"
+        return 'macOS既定出力 (afplay)'
 
-    # 音量レベルのゲッター/セッター
     @property
     def volume_level(self) -> int:
-        with self._lock:
+        with self._condition:
             return self._volume_level
 
     @volume_level.setter
     def volume_level(self, level: int) -> None:
-        level = max(0, min(3, int(level)))
-        with self._lock:
-            self._volume_level = level
+        with self._condition:
+            previous_level = self._volume_level
+            self._volume_level = max(0, min(3, int(level)))
+            if self._volume_level == 0:
+                self._stop_locked()
+            elif (self._volume_level != previous_level and self._current is not None
+                  and self._current[0] == 'beeps' and not self._current[1].is_set()):
+                # WAVには音量が焼き込まれるため、操作時は新しい音量で再生し直す。
+                self._stop_locked()
+                self._request('beeps')
 
     @property
     def enabled(self) -> bool:
-        with self._lock:
+        with self._condition:
             return self._enabled
 
     @enabled.setter
     def enabled(self, flag: bool) -> None:
-        with self._lock:
+        with self._condition:
             self._enabled = bool(flag)
             if not self._enabled:
-                # 再生中なら止める
-                self.stop()
-        
+                self._stop_locked()
+
+    @property
+    def playing(self) -> bool:
+        with self._condition:
+            return self._current is not None and not self._current[1].is_set()
+
     def generate_beep(self, frequency, duration):
-        """指定された周波数と長さのSin波を生成（フェードアウト付き）"""
+        """指定された周波数と長さのSin波を生成（フェードアウト付き）。"""
         samples = int(self.sample_rate * duration)
         t = np.linspace(0, duration, samples, False)
-        # 音量レベルを 0..3 -> 0.0..1.0 に変換
-        vol_level = self.volume_level
-        if vol_level <= 0:
-            # 無音を返す
-            return (np.zeros(samples)).astype(np.int16)
-        volume_scale = vol_level / 3.0
-        wave = (0.2 * volume_scale) * np.sin(2 * np.pi * frequency * t)
-        
-        # フェードアウトを追加（最後の10msをフェードアウト）
-        fade_samples = int(self.sample_rate * 0.01)  # 10ms
+        volume_scale = self.volume_level / 3.0
+        wave_data = (0.2 * volume_scale) * np.sin(2 * np.pi * frequency * t)
+        fade_samples = int(self.sample_rate * 0.01)
         if fade_samples < samples:
-            fade = np.linspace(1, 0, fade_samples)
-            wave[-fade_samples:] *= fade
-        
-        return (wave * 32767).astype(np.int16)
-    
+            wave_data[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+        return (wave_data * 32767).astype('<i2')
+
+    def _request(self, kind):
+        with self._condition:
+            if self._closed or not self._enabled or self._volume_level <= 0:
+                return
+            if kind == 'beeps':
+                if self._current is not None and not self._current[1].is_set():
+                    # afplayの終了に少し余裕が必要でも、10秒後の活動通知を捨てない。
+                    # 同じ活動の重複通知は無視し、次の再生は最大1件だけ予約する。
+                    now = time.monotonic()
+                    if (self._current[0] == 'beeps' and self._pending is None
+                            and now - self._last_beep_time >= self.BEEP_DURATION):
+                        self._pending = (kind, threading.Event())
+                        self._last_beep_time = now
+                    return
+                self._last_beep_time = time.monotonic()
+            else:
+                now = time.monotonic()
+                if now - self._last_neko_time < 5.0:
+                    return
+                self._last_neko_time = now
+            self._stop_locked()
+            # 取り消しイベントは再生要求ごとに作る。古い要求を再開させない。
+            self._current = (kind, threading.Event())
+            self._pending = self._current
+            self._condition.notify()
+
     def play_beeps(self):
-        """10秒間、ランダムな間隔とピッチで音を鳴らす"""
-        if self.playing:
-            return
-            
-        self.playing = True
-        self.stop_event.clear()
-        
-        def _play():
-            # サウンドが無効なら何もしない
-            if not self.enabled:
-                self.playing = False
-                return
+        self._request('beeps')
 
-            stream = None
-            
-            # ランダムな音程の範囲（Hz）
-            min_freq = 400
-            max_freq = 1600
-            beep_duration = 0.05  # 短めのビープ音
-            
-            start_time = time.time()
-            
-            try:
-                while time.time() - start_time < 10.0 and not self.stop_event.is_set():
-                    if not self.enabled:
-                        break
-                    if stream is None:
-                        pa_instance = self._ensure_pyaudio_ready()
-                        if pa_instance is not None:
-                            try:
-                                open_kwargs = dict(
-                                    format=pyaudio.paInt16,  # type: ignore
-                                    channels=1,
-                                    rate=self.sample_rate,
-                                    output=True
-                                )
-                                if self._default_device_index is not None:
-                                    open_kwargs['output_device_index'] = self._default_device_index
-                                stream = pa_instance.open(**open_kwargs)
-                            except Exception as e:
-                                print(f"音声出力エラー: {e}")
-                                self._invalidate_pyaudio()
-                                stream = None
-                        if stream is None:
-                            self._play_system_beeps_fallback(single=True)
-                            silence_duration = np.random.uniform(0.2, 1.0)
-                            time.sleep(silence_duration)
-                            continue
-
-                    # ランダムな周波数を生成
-                    freq = np.random.randint(min_freq, max_freq)
-                    
-                    # ビープ音を生成して再生
-                    beep = self.generate_beep(freq, beep_duration)
-                    if stream is not None:
-                        try:
-                            stream.write(beep.tobytes())
-                        except Exception as e:
-                            print(f"音声再生エラー: {e}")
-                            # ストリームが壊れた場合はPyAudioを再初期化してフォールバックに切り替え
-                            try:
-                                stream.stop_stream()
-                                stream.close()
-                            except Exception:
-                                pass
-                            stream = None
-                            self._invalidate_pyaudio()
-                            self._play_system_beeps_fallback(single=True)
-                            silence_duration = np.random.uniform(0.2, 1.0)
-                            time.sleep(silence_duration)
-                            continue
-                    else:
-                        # PyAudioが使えない場合はシステムサウンド
-                        self._play_system_beeps_fallback(single=True)
-                    
-                    # ランダムな無音期間（0.2秒〜1.0秒）
-                    silence_duration = np.random.uniform(0.2, 1.0)
-                    time.sleep(silence_duration)
-                    
-                    if time.time() - start_time >= 10.0:
-                        break
-                            
-            finally:
-                if stream is not None:
-                    try:
-                        stream.stop_stream()
-                        stream.close()
-                    except Exception:
-                        pass
-                self.playing = False
-        
-        # 別スレッドで音声再生
-        thread = threading.Thread(target=_play)
-        thread.daemon = True
-        thread.start()
-
-    def _play_system_beeps_fallback(self, single: bool = False):
-        """PyAudioが使えない場合にmacOSのシステムサウンドで代替再生
-        single=True の場合は即時に1回だけ鳴らす。
-        """
-        if not self.enabled:
-            return
-        if single:
-            self.play_quick_system_beep()
-            return
-        dprint("フォールバック: システムサウンドで通知します")
-        start_time = time.time()
-        end_time = start_time + 10.0
-        while time.time() < end_time and not self.stop_event.is_set():
-            if not self.enabled:
-                break
-            played = False
-            # afplay のシステム音を試す
-            try:
-                subprocess.run(['afplay', '/System/Library/Sounds/Pop.aiff'], capture_output=True)
-                played = True
-            except Exception:
-                pass
-            # osascript beep にフォールバック
-            if not played:
-                try:
-                    subprocess.run(['osascript', '-e', 'beep'], capture_output=True)
-                    played = True
-                except Exception:
-                    pass
-            # 少し間隔を空ける
-            time.sleep(float(np.random.uniform(0.2, 0.9)))
-    
-    def play_quick_system_beep(self):
-        """短いシステムビープ（1回）を非ブロッキングで実行"""
-        def _beep_once():
-            if not self.enabled:
-                return
-            # 可能なら afplay のシステム音、ダメなら osascript beep
-            try:
-                subprocess.run(['afplay', '/System/Library/Sounds/Pop.aiff'], capture_output=True)
-                return
-            except Exception:
-                pass
-            try:
-                subprocess.run(['osascript', '-e', 'beep'], capture_output=True)
-            except Exception:
-                pass
-        t = threading.Thread(target=_beep_once)
-        t.daemon = True
-        t.start()
-    
     def play_neko(self):
-        """入力待ち通知の猫の鳴き声を1回再生（非ブロッキング、最低5秒間隔）"""
-        if not self.enabled:
-            return
-        vol_level = self.volume_level
-        if vol_level <= 0:
-            return
-        now = time.time()
-        with self._lock:
-            if now - self._last_neko_time < 5.0:
-                return
-            self._last_neko_time = now
+        self._request('neko')
 
-        def _play():
-            subprocess.run(
-                ['afplay', '-v', str(vol_level / 3.0), str(NEKO_SOUND_FILE)],
-                capture_output=True)
-        t = threading.Thread(target=_play)
-        t.daemon = True
-        t.start()
+    def _run(self):
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._closed or self._pending is not None)
+                if self._closed:
+                    return
+                request = self._pending
+                self._pending = None
+            kind, cancel = request
+            try:
+                if kind == 'beeps':
+                    self._play_beeps(cancel)
+                else:
+                    self._play_file(NEKO_SOUND_FILE, cancel, self.volume_level / 3.0)
+            except Exception as error:
+                dprint(f'音声再生エラー: {error}')
+            finally:
+                with self._condition:
+                    # 新しく届いた再生要求を、古い要求の終了処理で消さない。
+                    if self._current is request:
+                        self._current = self._pending
+                    self._condition.notify_all()
+
+    def _play_beeps(self, cancel):
+        # 音と無音をまとめて生成し、プロセス起動時間を各ビープの間に挟まない。
+        samples = int(self.sample_rate * self.BEEP_DURATION)
+        sequence = np.zeros(samples, dtype='<i2')
+        offset = 0
+        beep_samples = int(self.sample_rate * 0.05)
+        while offset + beep_samples <= samples and not cancel.is_set():
+            beep = self.generate_beep(np.random.randint(400, 1600), 0.05)
+            sequence[offset:offset + beep_samples] = beep
+            offset += beep_samples + int(self.sample_rate * np.random.uniform(0.2, 1.0))
+        if cancel.is_set():
+            return
+        with tempfile.TemporaryDirectory(prefix='ccmon-audio-') as directory:
+            path = Path(directory) / 'beeps.wav'
+            with wave.open(str(path), 'wb') as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(self.sample_rate)
+                output.writeframes(sequence.tobytes())
+            self._play_file(path, cancel, duration=self.BEEP_DURATION)
+
+    def _play_file(self, path, cancel, volume=1.0, *, duration=0.0):
+        if cancel.is_set():
+            return False
+        # stdinや端末のシグナルを引き継がず、終了はこのワーカーが管理する。
+        process = subprocess.Popen(
+            ['/usr/bin/afplay', '-v', str(volume), str(path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        deadline = time.monotonic() + duration + self.PLAYBACK_TIMEOUT
+        try:
+            while not cancel.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    dprint('音声再生がタイムアウトしました。次の通知で再試行します。')
+                    return False
+                try:
+                    return process.wait(timeout=min(0.05, remaining)) == 0
+                except subprocess.TimeoutExpired:
+                    pass
+            return False
+        finally:
+            self._stop_process(process)
+
+    def _stop_process(self, process):
+        if process.poll() is not None:
+            return
+        for action in (process.terminate, process.kill):
+            try:
+                action()
+            except ProcessLookupError:
+                return
+            try:
+                process.wait(timeout=self.PROCESS_STOP_TIMEOUT)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        dprint('音声プロセスの終了待ちを打ち切りました。')
+
+    def _stop_locked(self):
+        if self._current is not None:
+            self._current[1].set()
+        self._pending = None
 
     def stop(self):
-        """音声再生を停止"""
-        self.stop_event.set()
-        self.playing = False
-    
+        with self._condition:
+            self._stop_locked()
+
     def cleanup(self):
-        """PyAudioのクリーンアップ"""
-        self.stop()
-        self._invalidate_pyaudio()
+        with self._condition:
+            self._closed = True
+            self._stop_locked()
+            self._condition.notify()
+        # 音声処理が異常でも、メインスレッドでは無期限に待たない。
+        self._worker.join(timeout=1.0)
 
 
 class ActivityTracker:
@@ -1145,12 +990,9 @@ def main():
                 time.sleep(3)
     except KeyboardInterrupt:
         print("\n終了します...")
-        for observer in observers:
-            observer.stop()
+    finally:
         sound_player.cleanup()
-    
-    for observer in observers:
-        observer.join()
+        stop_observers(observers)
     print("CCMonを終了しました。")
 
 
