@@ -1,3 +1,4 @@
 watchdog==6.0.0
 numpy==2.3.1
 rich==13.7.1
+anthropic>=1.17

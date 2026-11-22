@@ -13,6 +13,8 @@ CCMonは、macOS用のClaude/Codex/Cursor/Kimi/Agyの活動状況を、ピコピ
 - Antigravity (agy) の会話ログ更新を検知して音で通知（`~/.gemini/antigravity-cli/brain` / `antigravity/brain` / `antigravity-ide/brain`）
 - ランダムな音程でスパースな通知音を生成
 - Claude Code / Codex / Agy がターン完了や質問でユーザーの入力を待っている状態になると、猫の鳴き声で通知
+- Claude Code がユーザーの入力待ち（ターン完了・権限確認・質問）になると、ユーザーが操作するまで一定間隔でアラーム音を鳴らし続ける（フック連携）
+- 異常終了時は `run_ccmon.sh` が自動で再起動
 - FSEventsを使用した効率的なファイル監視
 
 ## 必要要件
@@ -50,6 +52,29 @@ python3 ccmon.py
 ```
 
 終了するには `Ctrl+C` を押してください。
+
+### 「自分のターン」アラーム（Claude Code）
+
+Claude Code のフックを使って、セッションが入力待ちになったことを ccmon に通知します。ログの推測ではなく Claude Code 自身のイベントを使うので、権限確認待ちも検出できます。
+
+`~/.claude/settings.json` の `hooks` に、以下のイベントで `hooks/ccmon_state.py` を登録します：
+`Stop`（ターン完了）、`Notification`（matcher: `permission_prompt|agent_needs_input|elicitation_dialog|elicitation_url_dialog`）、`UserPromptSubmit`・`PreToolUse`・`PostToolUse`・`SessionStart`（作業再開）、`SessionEnd`（終了）。
+
+```json
+{"type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_state.py\"", "timeout": 25}
+```
+
+バックグラウンドタスク（録画、ビルド、開発サーバーなど）が動いたままターンが終わった場合だけ、Claude Haiku に最後のメッセージを渡して「ユーザーがいま何かすべきか」を判定させます（1回あたり数百トークン、約1〜4秒）。質問・確認・成果物の完成・新しく起動や更新したサーバーの動作確認なら鳴らし、完了待ちや以前から動いているだけのサーバーなら鳴らしません。API キーは `ANTHROPIC_API_KEY` または `~/keys/claude.md` から読みます。キーが無い・判定に失敗した場合は鳴らしません。バックグラウンドタスクが無ければ LLM は呼びません（`anthropic` パッケージ入りの `venv/bin/python3` でフックを動かしてください）。
+
+フックは `~/.ccmon/state/<session_id>.json` に状態を書き、ccmon がそれを監視します。TUI の `Your turn:` 行に入力待ちセッションの作業ディレクトリ名が表示され、`s` キーでアラームを止められます（次の入力待ちで再び鳴ります）。
+
+調整項目は `ccmon.py` 冒頭の定数で変更できます：
+
+- `ALARM_INTERVAL_SECONDS`（既定10秒）: 鳴らす間隔
+- `ALARM_MAX_SECONDS`（既定15分）: 1回の入力待ちで鳴らし続ける上限
+- `ALARM_STOP_ON_USER_ACTIVITY`（既定 `True`）: 入力待ちになった後にキーボード・マウスを触ったら「気づいた」とみなしてそのアラームを止める。次の入力待ちで再び鳴る
+- `ALARM_ONLY_WHEN_IDLE` / `ALARM_IDLE_SECONDS`: `True` にすると、キーボード・マウスを一定時間触っていない時だけ鳴らす
+- アラーム音: `sounds/alarm.mp3`（`.aiff` / `.wav` も可）を置けばそれを使い、なければ macOS の `Glass.aiff`
 
 ## 動作説明
 

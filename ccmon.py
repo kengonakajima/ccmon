@@ -94,6 +94,22 @@ except ImportError:
 # 入力待ち通知用の猫の鳴き声（効果音ラボ https://soundeffect-lab.info/）
 NEKO_SOUND_FILE = Path(__file__).resolve().parent / 'sounds' / 'neko.mp3'
 
+# 「自分のターン」アラーム設定
+# hooks/ccmon_state.py が Claude Code のフックから STATE_DIR に状態を書き、ここで監視する
+STATE_DIR = Path(os.environ.get('CCMON_STATE_DIR') or (CONFIG_DIR / 'state'))  # テスト時は差し替え可
+ALARM_INTERVAL_SECONDS = 10.0       # アラームの再生間隔
+ALARM_MAX_SECONDS = 15 * 60         # 1回の入力待ちで鳴らし続ける上限
+ALARM_STALE_SECONDS = 10 * 60       # 起動時にこれより古い待ち状態は無視（終了済みセッション対策）
+ALARM_STOP_ON_USER_ACTIVITY = True  # 入力待ちになった後にキーボード/マウスを触ったら、そのアラームを止める
+ALARM_ONLY_WHEN_IDLE = False        # True にすると、一定時間操作していない時だけ鳴らす
+ALARM_IDLE_SECONDS = 30.0           # ↑の「一定時間」
+_ALARM_CANDIDATES = [
+    Path(__file__).resolve().parent / 'sounds' / 'alarm.mp3',
+    Path(__file__).resolve().parent / 'sounds' / 'alarm.aiff',
+    Path(__file__).resolve().parent / 'sounds' / 'alarm.wav',
+]
+ALARM_SOUND_FILE = next((p for p in _ALARM_CANDIDATES if p.exists()), Path('/System/Library/Sounds/Glass.aiff'))
+
 
 def create_observer(*, polling=False):
     """OS通知が届かない監視対象はポーリングを使う。"""
@@ -205,11 +221,12 @@ class SoundPlayer:
                         self._last_beep_time = now
                     return
                 self._last_beep_time = time.monotonic()
-            else:
+            elif kind == 'neko':
                 now = time.monotonic()
                 if now - self._last_neko_time < 5.0:
                     return
                 self._last_neko_time = now
+            # alarm は alarm_loop 側で間隔を管理するので抑制しない
             self._stop_locked()
             # 取り消しイベントは再生要求ごとに作る。古い要求を再開させない。
             self._current = (kind, threading.Event())
@@ -221,6 +238,10 @@ class SoundPlayer:
 
     def play_neko(self):
         self._request('neko')
+
+    def play_alarm(self):
+        """「自分のターン」アラーム音を1回再生"""
+        self._request('alarm')
 
     def _run(self):
         while True:
@@ -234,6 +255,8 @@ class SoundPlayer:
             try:
                 if kind == 'beeps':
                     self._play_beeps(cancel)
+                elif kind == 'alarm':
+                    self._play_file(ALARM_SOUND_FILE, cancel, self.volume_level / 3.0)
                 else:
                     self._play_file(NEKO_SOUND_FILE, cancel, self.volume_level / 3.0)
             except Exception as error:
@@ -353,6 +376,156 @@ class ActivityTracker:
         with self._lock:
             return {name: (now - last) <= self.window
                     for name, last in self._last.items()}
+
+
+class WaitingRegistry:
+    """Claude Code 各セッションの「入力待ち/作業中」状態を保持する。
+    状態は hooks/ccmon_state.py が STATE_DIR に書く JSON から読む。
+    """
+    def __init__(self):
+        self._sessions = {}   # session_id -> record(dict)
+        self._silenced = {}   # session_id -> 無視する待ち状態の ts
+        self._seen = {}       # path -> (mtime_ns, size) 変更検出用
+        self._lock = threading.Lock()
+
+    def load_all(self):
+        """起動時に既存の状態ファイルを読み込む。古い待ち状態は無視する。"""
+        now = time.time()
+        for p in STATE_DIR.glob('*.json'):
+            rec = self._read(p)
+            if rec is None:
+                continue
+            try:
+                st = p.stat()
+                self._seen[str(p)] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+            if rec.get('state') == 'waiting' and now - float(rec.get('ts', 0)) > ALARM_STALE_SECONDS:
+                continue
+            with self._lock:
+                self._sessions[rec['session_id']] = rec
+
+    @staticmethod
+    def _read(path: Path) -> Optional[dict]:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(rec, dict) or not rec.get('session_id'):
+            return None
+        return rec
+
+    def update_from_file(self, path: str):
+        rec = self._read(Path(path))
+        if rec is None:
+            return
+        with self._lock:
+            self._sessions[rec['session_id']] = rec
+        dprint(f"状態更新: {rec.get('session_id')} -> {rec.get('state')} ({rec.get('event')})")
+
+    def remove_file(self, path: str):
+        sid = Path(path).stem
+        with self._lock:
+            self._sessions.pop(sid, None)
+            self._silenced.pop(sid, None)
+        dprint(f"状態削除: {sid}")
+
+    def refresh(self):
+        """STATE_DIR を走査し、変更されたファイルだけ読み直す。消えたファイルは登録から外す。
+        FSEvents は rename 直後に偽の deleted を出すことがあるため、通知ではなく実在で判断する。
+        """
+        try:
+            entries = {p: p.stat() for p in STATE_DIR.glob('*.json')}
+        except OSError:
+            return
+        current = {str(p): (st.st_mtime_ns, st.st_size) for p, st in entries.items()}
+        for path, sig in current.items():
+            if self._seen.get(path) != sig:
+                self._seen[path] = sig
+                self.update_from_file(path)
+        for path in list(self._seen):
+            if path not in current:
+                del self._seen[path]
+                self.remove_file(path)
+
+    def waiting_sessions(self) -> list:
+        """アラーム対象の待ちセッション一覧（上限時間内・消音されていないもの）"""
+        now = time.time()
+        result = []
+        with self._lock:
+            for sid, rec in self._sessions.items():
+                if rec.get('state') != 'waiting':
+                    continue
+                ts = float(rec.get('ts', 0))
+                if now - ts > ALARM_MAX_SECONDS:
+                    continue
+                if self._silenced.get(sid) == ts:
+                    continue
+                result.append(rec)
+        return result
+
+    def silence_all(self):
+        """現在の待ち状態を消音する。次に新しい待ち状態になれば再び鳴る。"""
+        with self._lock:
+            for sid, rec in self._sessions.items():
+                if rec.get('state') == 'waiting':
+                    self._silenced[sid] = float(rec.get('ts', 0))
+
+    def silence_started_before(self, cutoff: float):
+        """cutoff より前に始まった待ち状態を消音する（ユーザーがその後に操作した＝気づいた）。"""
+        with self._lock:
+            for sid, rec in self._sessions.items():
+                if rec.get('state') != 'waiting':
+                    continue
+                ts = float(rec.get('ts', 0))
+                if ts < cutoff and self._silenced.get(sid) != ts:
+                    self._silenced[sid] = ts
+                    dprint(f"ユーザー操作を検知したため消音: {sid}")
+
+
+# main と run_tui で共有する。テストが run_tui を3引数で呼べるようモジュール単位で持つ
+WAITING_REGISTRY = WaitingRegistry()
+
+
+def hid_idle_seconds() -> float:
+    """最後のキー/マウス操作からの経過秒数（macOS）。取得できなければ 0。"""
+    try:
+        out = subprocess.run(['ioreg', '-c', 'IOHIDSystem', '-d', '4'],
+                             capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if 'HIDIdleTime' in line:
+                return int(line.rsplit('=', 1)[1].strip()) / 1e9
+    except Exception:
+        pass
+    return 0.0
+
+
+def alarm_loop(registry: WaitingRegistry, sound_player: SoundPlayer, stop_event: threading.Event):
+    """待ちセッションがある間、一定間隔でアラーム音を鳴らす。"""
+    last_alarm = 0.0
+    prev_episode = frozenset()
+    while not stop_event.is_set():
+        registry.refresh()
+        waiting = registry.waiting_sessions()
+        if waiting and ALARM_STOP_ON_USER_ACTIVITY:
+            # 最後のキー/マウス操作の時刻より前に始まった待ちは、ユーザーがもう気づいている
+            idle = hid_idle_seconds()
+            if idle > 0:
+                registry.silence_started_before(time.time() - idle)
+                waiting = registry.waiting_sessions()
+        if waiting:
+            now = time.time()
+            # 新しい入力待ちが始まった直後は猫の声が鳴るので、アラームは1間隔おいてから始める
+            episode = frozenset((r.get('session_id'), r.get('ts')) for r in waiting)
+            if episode - prev_episode:
+                last_alarm = now
+            prev_episode = episode
+            if now - last_alarm >= ALARM_INTERVAL_SECONDS:
+                if not ALARM_ONLY_WHEN_IDLE or hid_idle_seconds() >= ALARM_IDLE_SECONDS:
+                    sound_player.play_alarm()
+                    last_alarm = now
+        stop_event.wait(0.5)
 
 
 def read_last_jsonl_line(path: str) -> Optional[str]:
@@ -837,6 +1010,8 @@ class TerminalInput:
                         keys.append('QUIT')
                     elif c in ('o', 'O'):
                         keys.append('TOGGLE')
+                    elif c in ('s', 'S'):
+                        keys.append('SILENCE')
                     # Enterでトグルも可
                     elif c in ('\r', '\n'):
                         keys.append('TOGGLE')
@@ -848,7 +1023,7 @@ class TerminalInput:
         return keys
 
 
-def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label: str) -> Panel:
+def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label: str, waiting: list = ()) -> Panel:
     """RichのUIを構築して返す。"""
     # 上段: On/Off ステータス
     status_text = Text()
@@ -888,6 +1063,17 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     output_text = Text("Output: ")
     output_text.append(output_label, style="bold")
 
+    # 入力待ちセッション（自分のターン）
+    waiting_text = Text("Your turn: ")
+    if waiting:
+        names = []
+        for rec in waiting:
+            cwd = rec.get('cwd') or rec.get('session_id') or '?'
+            names.append(Path(cwd).name or cwd)
+        waiting_text.append("  ".join(names), style="bold yellow")
+    else:
+        waiting_text.append("-", style="dim")
+
     body = Text()
     body.append_text(status_text)
     body.append("\n")
@@ -896,18 +1082,25 @@ def build_ui(enabled: bool, volume_level: int, active_status: dict, output_label
     body.append_text(vol_text)
     body.append("\n")
     body.append_text(output_text)
+    body.append("\n")
+    body.append_text(waiting_text)
     body.append("\n\n")
-    body.append("[Space]/矢印: 音量  o/Enter: On/Off  q: 終了", style="italic dim")
+    body.append("[Space]/矢印: 音量  o/Enter: On/Off  s: アラーム停止  q: 終了", style="italic dim")
 
     return Panel(body, title="CCMon", border_style="cyan")
 
 
-def run_tui(console, sound_player, activity_tracker):
+def run_tui(console, sound_player, activity_tracker, waiting_registry=None):
     """キー入力を確認し、状態や端末サイズが変わった時だけ再描画する。"""
+    if waiting_registry is None:
+        waiting_registry = WAITING_REGISTRY
+
     def ui_state():
+        waiting = waiting_registry.waiting_sessions()
+        waiting_key = tuple((r.get('session_id'), r.get('ts'), r.get('cwd')) for r in waiting)
         return (sound_player.enabled, sound_player.volume_level,
                 activity_tracker.snapshot(), sound_player.get_output_device_label(),
-                console.size)
+                waiting, waiting_key, console.size)
 
     try:
         console.clear()
@@ -915,7 +1108,7 @@ def run_tui(console, sound_player, activity_tracker):
         pass
     with TerminalInput() as tinput:
         previous_state = ui_state()
-        with Live(build_ui(*previous_state[:4]), console=console, auto_refresh=False) as live:
+        with Live(build_ui(*previous_state[:5]), console=console, auto_refresh=False) as live:
             while True:
                 for key in tinput.read_keys():
                     # 右に動く = 表示上で右(3 2 1 0)へ → 値は減少
@@ -930,12 +1123,14 @@ def run_tui(console, sound_player, activity_tracker):
                         if not sound_player.enabled:
                             sound_player.stop()
                         save_sound_enabled(sound_player.enabled)
+                    elif key == 'SILENCE':
+                        waiting_registry.silence_all()
                     elif key == 'QUIT':
                         raise KeyboardInterrupt
 
                 current_state = ui_state()
-                if current_state != previous_state:
-                    live.update(build_ui(*current_state[:4]), refresh=True)
+                if current_state[:4] != previous_state[:4] or current_state[5:] != previous_state[5:]:
+                    live.update(build_ui(*current_state[:5]), refresh=True)
                     previous_state = current_state
                 time.sleep(0.1)
 
@@ -1014,7 +1209,16 @@ def main():
         # 読み込みに失敗した場合は既定(2)を維持
         pass
     activity_tracker = ActivityTracker(window_seconds=10)
-    
+
+    # 「自分のターン」アラーム: フックが書く状態ディレクトリを監視
+    waiting_registry = WAITING_REGISTRY
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    waiting_registry.load_all()
+    alarm_stop_event = threading.Event()
+    alarm_thread = threading.Thread(
+        target=alarm_loop, args=(waiting_registry, sound_player, alarm_stop_event), daemon=True)
+    alarm_thread.start()
+
     # ファイルシステム監視の開始
     # Codex以外はOSの変更通知でアイドル中の全ファイル走査を避ける
     observers = []
@@ -1102,6 +1306,7 @@ def main():
     except KeyboardInterrupt:
         print("\n終了します...")
     finally:
+        alarm_stop_event.set()
         sound_player.cleanup()
         stop_observers(observers)
     print("CCMonを終了しました。")
