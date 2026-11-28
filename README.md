@@ -76,6 +76,14 @@ Claude Code のフックを使って、セッションが入力待ちになっ�
 - `ALARM_ONLY_WHEN_IDLE` / `ALARM_IDLE_SECONDS`: `True` にすると、キーボード・マウスを一定時間触っていない時だけ鳴らす
 - アラーム音: `sounds/alarm.mp3`（`.aiff` / `.wav` も可）を置けばそれを使い、なければ macOS の `Glass.aiff`
 
+### Mac操作時刻・アプリ名の活動ログ
+
+時間配分（Mac操作中・AI待ち中・離席中）を後から集計できるよう、10秒間隔で `~/.ccmon/activity/YYYY-MM.jsonl` に軽量な活動ログを追記します。
+
+- 記録内容: 時刻（`ts`/`iso`）、操作の有無（`active`）、無操作秒数（`idle_s`）、最終操作時刻（`last_input_ts`）、最前面アプリ名（`app`）、稼働中エージェント（`agents`）、入力待ち（`waiting`）
+- プライバシー配慮: キー入力の内容・URL・ウィンドウタイトルは一切記録しません（macOS の `HIDIdleTime` と最前面アプリ名のみ取得するため、アクセシビリティ権限も不要です）
+- 低負荷設計: 完全離席かつAI停止が続く間は状態遷移と5分ごとのハートビートのみ書き込みます。無効化する場合は `CCMON_ACTIVITY_LOG=0` を指定してください。
+
 ### 「自分のターン」アラーム（Antigravity / agy）
 
 `agy` のフック機能（`~/.gemini/config/hooks.json`）に `hooks/ccmon_agy_state.py` を登録すると、以下のタイミングで Claude Code と同じ 10 秒おきアラームが鳴ります：

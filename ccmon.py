@@ -4,6 +4,7 @@ CCMon - Claude/Codex/Cursor/Opencode/Kimi/Agy Monitor
 macOS用のコーディングエージェントの活動状況を音で表現するモニターツール
 """
 
+import ctypes
 import os
 import json
 import sys
@@ -102,6 +103,17 @@ def state_dir() -> Path:
     """状態ディレクトリ。テストで Path.home() を差し替えたときも追従するよう、呼ぶたびに決める。"""
     env = os.environ.get('CCMON_STATE_DIR')
     return Path(env) if env else Path.home() / '.ccmon' / 'state'
+
+
+def activity_log_dir() -> Path:
+    """操作時刻・アプリ名の活動ログ保存先。テストで Path.home() や環境変数を差し替えられる。"""
+    env = os.environ.get('CCMON_ACTIVITY_DIR')
+    return Path(env) if env else Path.home() / '.ccmon' / 'activity'
+
+
+ACTIVITY_LOG_ENABLED = str(os.environ.get('CCMON_ACTIVITY_LOG', '1')).lower() not in ('0', 'false', 'no')
+ACTIVITY_LOG_INTERVAL_SECONDS = 10.0    # 操作時刻のサンプリング間隔（秒）
+ACTIVITY_LOG_HEARTBEAT_SECONDS = 300.0  # 完全離席＆AI停止が続く間の生存記録間隔（秒）
 
 
 ALARM_INTERVAL_SECONDS = 10.0       # アラームの再生間隔
@@ -495,8 +507,72 @@ class WaitingRegistry:
 WAITING_REGISTRY = WaitingRegistry()
 
 
+_CG_LIB = None
+_CF_LIB = None
+_CG_KEYS = None
+_CG_LIB_LOADED = False
+
+
+def _ensure_cg_libs():
+    """CoreGraphics / CoreFoundation を初回だけロードして再利用する（プロセス起動なし）。"""
+    global _CG_LIB, _CF_LIB, _CG_KEYS, _CG_LIB_LOADED
+    if _CG_LIB_LOADED:
+        return _CG_LIB, _CF_LIB, _CG_KEYS
+    _CG_LIB_LOADED = True
+    try:
+        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+        cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+        cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+
+        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        utf8 = 0x08000100  # kCFStringEncodingUTF8
+        keys = (
+            cf.CFStringCreateWithCString(None, b'kCGWindowLayer', utf8),
+            cf.CFStringCreateWithCString(None, b'kCGWindowOwnerName', utf8),
+            cf.CFStringCreateWithCString(None, b'kCGWindowAlpha', utf8),
+        )
+        _CG_LIB, _CF_LIB, _CG_KEYS = cg, cf, keys
+    except Exception:
+        _CG_LIB, _CF_LIB, _CG_KEYS = None, None, None
+    return _CG_LIB, _CF_LIB, _CG_KEYS
+
+
+def _cg_idle_seconds() -> Optional[float]:
+    """CoreGraphics 経由で最後のキー/マウス操作からの経過秒数を取得（プロセス起動なし）。"""
+    cg, _, _ = _ensure_cg_libs()
+    if cg is None:
+        return None
+    try:
+        # kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = 0xFFFFFFFF
+        sec = float(cg.CGEventSourceSecondsSinceLastEventType(0, 0xFFFFFFFF))
+        if sec >= 0:
+            return sec
+    except Exception:
+        pass
+    return None
+
+
 def hid_idle_seconds() -> float:
     """最後のキー/マウス操作からの経過秒数（macOS）。取得できなければ 0。"""
+    cg_sec = _cg_idle_seconds()
+    if cg_sec is not None:
+        return cg_sec
     try:
         out = subprocess.run(['ioreg', '-c', 'IOHIDSystem', '-d', '4'],
                              capture_output=True, text=True, timeout=2).stdout
@@ -506,6 +582,148 @@ def hid_idle_seconds() -> float:
     except Exception:
         pass
     return 0.0
+
+
+def frontmost_app_name() -> Optional[str]:
+    """現在最前面にある macOS アプリ名のみを取得（ウィンドウタイトルや入力内容は取得しない・プロセス起動なし）。"""
+    cg, cf, keys = _ensure_cg_libs()
+    if cg is None or cf is None or keys is None:
+        return None
+    k_layer, k_owner, k_alpha = keys
+    # kCGWindowListOptionOnScreenOnly (1) | kCGWindowListExcludeDesktopElements (16)
+    arr = cg.CGWindowListCopyWindowInfo(1 | 16, 0)
+    if not arr:
+        return None
+    try:
+        utf8 = 0x08000100
+        k_int = 9       # kCFNumberIntType
+        k_double = 13   # kCFNumberFloat64Type
+        buf = ctypes.create_string_buffer(256)
+        count = cf.CFArrayGetCount(arr)
+        for i in range(count):
+            win = cf.CFArrayGetValueAtIndex(arr, i)
+            if not win:
+                continue
+            lv = cf.CFDictionaryGetValue(win, k_layer)
+            layer = ctypes.c_int(999)
+            if not lv or not cf.CFNumberGetValue(lv, k_int, ctypes.byref(layer)) or layer.value != 0:
+                continue
+            av = cf.CFDictionaryGetValue(win, k_alpha)
+            if av:
+                alpha = ctypes.c_double(1.0)
+                if cf.CFNumberGetValue(av, k_double, ctypes.byref(alpha)) and alpha.value <= 0.0:
+                    continue
+            ov = cf.CFDictionaryGetValue(win, k_owner)
+            if ov and cf.CFStringGetCString(ov, buf, len(buf), utf8):
+                name = buf.value.decode('utf-8', 'replace').strip()
+                if name:
+                    return name
+    except Exception:
+        return None
+    finally:
+        cf.CFRelease(arr)
+    return None
+
+
+class ActivityLogger:
+    """Mac の操作時刻（HIDアイドル時間）・最前面アプリ名・AIエージェント稼働状況を月別 JSONL に記録する。
+
+    プライバシー配慮のため、キー入力内容・URL・ウィンドウタイトルは一切記録しない。
+    完全離席＆AI停止が続く間は状態遷移とハートビート（既定5分）のみ記録し、ログ肥大化とCPU負荷を抑える。
+    """
+
+    def __init__(
+        self,
+        activity_tracker: ActivityTracker,
+        waiting_registry: WaitingRegistry,
+        *,
+        log_dir: Optional[Path] = None,
+        interval_seconds: float = ACTIVITY_LOG_INTERVAL_SECONDS,
+        heartbeat_seconds: float = ACTIVITY_LOG_HEARTBEAT_SECONDS,
+        idle_fn=None,
+        frontmost_fn=None,
+        now_fn=None,
+    ):
+        self.activity_tracker = activity_tracker
+        self.waiting_registry = waiting_registry
+        self._log_dir_override = Path(log_dir) if log_dir is not None else None
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.heartbeat_seconds = max(self.interval_seconds, float(heartbeat_seconds))
+        self._idle_fn = idle_fn or hid_idle_seconds
+        self._frontmost_fn = frontmost_fn or frontmost_app_name
+        self._now_fn = now_fn or time.time
+        self._last_state: Optional[tuple] = None
+        self._last_written_ts: float = 0.0
+        self._last_app: Optional[str] = None
+
+    def _target_dir(self) -> Path:
+        return self._log_dir_override if self._log_dir_override is not None else activity_log_dir()
+
+    def _waiting_labels(self) -> list[str]:
+        labels = []
+        for rec in self.waiting_registry.waiting_sessions():
+            sid = str(rec.get('session_id') or '')
+            tool = 'agy' if sid.startswith('agy_') else 'claude'
+            cwd = rec.get('cwd') or ''
+            folder = Path(cwd).name if cwd else ''
+            labels.append(f'{tool}:{folder}' if folder else tool)
+        return sorted(set(labels))
+
+    def sample_once(self) -> Optional[dict]:
+        """1回サンプリングし、記録条件を満たす場合のみ月別 JSONL に追記してレコードを返す。"""
+        now = float(self._now_fn())
+        idle_s = max(0.0, float(self._idle_fn()))
+        active = idle_s < self.interval_seconds
+        agents = sorted(k for k, v in self.activity_tracker.snapshot().items() if v)
+        waiting = self._waiting_labels()
+
+        # 離席が続いていて AI も止まっている間はアプリ名取得自体を省略する
+        prev_active = self._last_state[0] if self._last_state is not None else None
+        need_app = active or bool(agents) or bool(waiting) or (prev_active is None) or (prev_active != active)
+        app = self._frontmost_fn() if need_app else self._last_app
+        if need_app:
+            self._last_app = app
+
+        state_key = (active, app, tuple(agents), tuple(waiting))
+        state_changed = (state_key != self._last_state)
+        heartbeat_due = (now - self._last_written_ts) >= self.heartbeat_seconds
+        should_write = active or bool(agents) or bool(waiting) or state_changed or heartbeat_due
+
+        self._last_state = state_key
+        if not should_write:
+            return None
+
+        local_dt = datetime.fromtimestamp(now).astimezone()
+        record = {
+            'ts': round(now, 1),
+            'iso': local_dt.isoformat(timespec='seconds'),
+            'active': active,
+            'idle_s': round(idle_s, 1),
+            'last_input_ts': round(max(0.0, now - idle_s), 1),
+            'app': app,
+            'agents': agents,
+            'waiting': waiting,
+        }
+        try:
+            out_dir = self._target_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{local_dt.strftime('%Y-%m')}.jsonl"
+            with open(out_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            self._last_written_ts = now
+        except Exception as e:
+            dprint(f"活動ログ書き込みエラー: {e}")
+        return record
+
+
+def activity_log_loop(logger: ActivityLogger, stop_event: threading.Event):
+    """一定間隔で Mac の操作時刻・アプリ名・AI稼働状況を記録し続けるバックグラウンドループ。"""
+    while not stop_event.is_set():
+        try:
+            logger.sample_once()
+        except Exception as e:
+            dprint(f"活動ログ記録エラー: {e}")
+        stop_event.wait(logger.interval_seconds)
 
 
 def alarm_loop(registry: WaitingRegistry, sound_player: SoundPlayer, stop_event: threading.Event):
@@ -1225,6 +1443,13 @@ def main():
     alarm_thread = threading.Thread(
         target=alarm_loop, args=(waiting_registry, sound_player, alarm_stop_event), daemon=True)
     alarm_thread.start()
+
+    # Mac操作時刻・最前面アプリ名・AI稼働状況の軽量ログ記録（~/.ccmon/activity/YYYY-MM.jsonl）
+    if ACTIVITY_LOG_ENABLED:
+        activity_logger = ActivityLogger(activity_tracker, waiting_registry)
+        activity_log_thread = threading.Thread(
+            target=activity_log_loop, args=(activity_logger, alarm_stop_event), daemon=True)
+        activity_log_thread.start()
 
     # ファイルシステム監視の開始
     # Codex以外はOSの変更通知でアイドル中の全ファイル走査を避ける
