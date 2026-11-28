@@ -114,6 +114,7 @@ def activity_log_dir() -> Path:
 ACTIVITY_LOG_ENABLED = str(os.environ.get('CCMON_ACTIVITY_LOG', '1')).lower() not in ('0', 'false', 'no')
 ACTIVITY_LOG_INTERVAL_SECONDS = 10.0    # 操作時刻のサンプリング間隔（秒）
 ACTIVITY_LOG_HEARTBEAT_SECONDS = 300.0  # 完全離席＆AI停止が続く間の生存記録間隔（秒）
+WORKING_STALE_SECONDS = 20 * 60         # フックの working 状態を鮮度切れとみなす上限（秒）
 
 
 ALARM_INTERVAL_SECONDS = 10.0       # アラームの再生間隔
@@ -484,6 +485,20 @@ class WaitingRegistry:
                 result.append(rec)
         return result
 
+    def working_sessions(self, stale_seconds: float = WORKING_STALE_SECONDS) -> list:
+        """フックで作業中（working）と報告されている鮮度内のセッション一覧。"""
+        now = time.time()
+        result = []
+        with self._lock:
+            for rec in self._sessions.values():
+                if rec.get('state') != 'working':
+                    continue
+                ts = float(rec.get('ts', 0))
+                if now - ts > stale_seconds:
+                    continue
+                result.append(rec)
+        return result
+
     def silence_all(self):
         """現在の待ち状態を消音する。次に新しい待ち状態になれば再び鳴る。"""
         with self._lock:
@@ -659,6 +674,16 @@ class ActivityLogger:
     def _target_dir(self) -> Path:
         return self._log_dir_override if self._log_dir_override is not None else activity_log_dir()
 
+    def _working_agent_names(self) -> list[str]:
+        fn = getattr(self.waiting_registry, 'working_sessions', None)
+        if not callable(fn):
+            return []
+        names = set()
+        for rec in fn():
+            sid = str(rec.get('session_id') or '')
+            names.add('agy' if sid.startswith('agy_') else 'claude')
+        return sorted(names)
+
     def _waiting_labels(self) -> list[str]:
         labels = []
         for rec in self.waiting_registry.waiting_sessions():
@@ -674,7 +699,9 @@ class ActivityLogger:
         now = float(self._now_fn())
         idle_s = max(0.0, float(self._idle_fn()))
         active = idle_s < self.interval_seconds
-        agents = sorted(k for k, v in self.activity_tracker.snapshot().items() if v)
+        file_agents = [k for k, v in self.activity_tracker.snapshot().items() if v]
+        hook_agents = self._working_agent_names()
+        agents = sorted(set(file_agents) | set(hook_agents))
         waiting = self._waiting_labels()
 
         # 離席が続いていて AI も止まっている間はアプリ名取得自体を省略する

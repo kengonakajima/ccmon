@@ -80,9 +80,15 @@ Claude Code のフックを使って、セッションが入力待ちになっ�
 
 時間配分（Mac操作中・AI待ち中・離席中）を後から集計できるよう、10秒間隔で `~/.ccmon/activity/YYYY-MM.jsonl` に軽量な活動ログを追記します。
 
-- 記録内容: 時刻（`ts`/`iso`）、操作の有無（`active`）、無操作秒数（`idle_s`）、最終操作時刻（`last_input_ts`）、最前面アプリ名（`app`）、稼働中エージェント（`agents`）、入力待ち（`waiting`）
+- 記録内容: 時刻（`ts`/`iso`）、操作の有無（`active`）、無操作秒数（`idle_s`）、最終操作時刻（`last_input_ts`）、最前面アプリ名（`app`）、稼働中エージェント（`agents`：ファイル監視＋フックの `working` 状態を合流）、入力待ち（`waiting`）
 - プライバシー配慮: キー入力の内容・URL・ウィンドウタイトルは一切記録しません（macOS の `HIDIdleTime` と最前面アプリ名のみ取得するため、アクセシビリティ権限も不要です）
 - 低負荷設計: 完全離席かつAI停止が続く間は状態遷移と5分ごとのハートビートのみ書き込みます。無効化する場合は `CCMON_ACTIVITY_LOG=0` を指定してください。
+- 集計・可視化コマンド:
+  ```bash
+  ./venv/bin/python3 report_activity.py               # 今月のサマリー表示＋PNG/SVGグラフ生成（~/.ccmon/reports/）
+  ./venv/bin/python3 report_activity.py --days 7      # 直近7日間
+  ./venv/bin/python3 report_activity.py --month 2026-11 --meetings ~/arkn/drafts/meetings-time-2026-11.csv
+  ```
 
 ### 「自分のターン」アラーム（Antigravity / agy）
 

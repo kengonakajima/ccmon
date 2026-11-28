@@ -6,15 +6,17 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import ccmon
+import report_activity
 
 
 class TestActivityLogger(unittest.TestCase):
     def _make_logger(self, tmpdir, *, idle_fn, frontmost_fn, now_fn, agents=None, waiting=None,
-                     interval=10.0, heartbeat=300.0):
+                     working=None, interval=10.0, heartbeat=300.0):
         tracker = Mock()
         tracker.snapshot.return_value = dict(agents or {})
         registry = Mock()
         registry.waiting_sessions.return_value = list(waiting or [])
+        registry.working_sessions.return_value = list(working or [])
         logger = ccmon.ActivityLogger(
             tracker,
             registry,
@@ -149,6 +151,78 @@ class TestActivityLogger(unittest.TestCase):
         with patch('ccmon.subprocess.Popen', side_effect=AssertionError('must not spawn subprocess')):
             name = ccmon.frontmost_app_name()
         self.assertTrue(name is None or (isinstance(name, str) and len(name) > 0))
+
+    def test_merges_hook_working_sessions_into_agents(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            t = 1795874400.0
+            logger, _, _ = self._make_logger(
+                tmpdir,
+                idle_fn=lambda: 45.0,
+                frontmost_fn=lambda: 'Claude',
+                now_fn=lambda: t,
+                agents={'claude': False, 'codex': True},
+                working=[
+                    {'session_id': 'abc-123', 'state': 'working', 'ts': t - 30},
+                    {'session_id': 'agy_xyz', 'state': 'working', 'ts': t - 10},
+                ],
+            )
+            rec = logger.sample_once()
+            self.assertIsNotNone(rec)
+            self.assertFalse(rec['active'])
+            self.assertEqual(rec['agents'], ['agy', 'claude', 'codex'])
+
+    def test_waiting_registry_working_sessions_filters_stale_and_non_working(self):
+        reg = ccmon.WaitingRegistry()
+        now = 1795875000.0
+        reg._sessions = {
+            'fresh_claude': {'session_id': 'fresh_claude', 'state': 'working', 'ts': now - 60},
+            'stale_claude': {'session_id': 'stale_claude', 'state': 'working', 'ts': now - 2000},
+            'waiting_agy':  {'session_id': 'agy_1', 'state': 'waiting', 'ts': now - 10},
+        }
+        with patch('ccmon.time.time', return_value=now):
+            working = reg.working_sessions(stale_seconds=1200)
+        self.assertEqual([r['session_id'] for r in working], ['fresh_claude'])
+
+
+class TestReportActivity(unittest.TestCase):
+    def test_analyze_5_categories_apps_agents_and_sleep_gap(self):
+        jst = timezone(timedelta(hours=9))
+        base = datetime(2026, 11, 28, 10, 0, 0, tzinfo=jst).timestamp()
+        recs = [
+            # 10:00:00 -> 10:01:00 (60s): human_only (ChatGPT)
+            {'ts': base,       'active': True,  'app': 'ChatGPT', 'agents': [],         'waiting': []},
+            # 10:01:00 -> 10:03:00 (120s): human_and_ai (Claude + claude)
+            {'ts': base + 60,  'active': True,  'app': 'Claude',  'agents': ['claude'], 'waiting': []},
+            # 10:03:00 -> 10:05:00 (120s): away_ai (agy)
+            {'ts': base + 180, 'active': False, 'app': 'Ghostty', 'agents': ['agy'],    'waiting': []},
+            # 10:05:00 -> 10:06:00 (60s): away_waiting (pickup lag)
+            {'ts': base + 300, 'active': False, 'app': 'Ghostty', 'agents': [],         'waiting': ['agy:arkn']},
+            # 10:06:00 -> 10:20:00 (840s > 360s sleep gap -> capped to 10s tail!)
+            {'ts': base + 360, 'active': False, 'app': 'Ghostty', 'agents': [],         'waiting': []},
+            # 10:20:00 (last record -> 10s tail): human_only (Antigravity)
+            {'ts': base + 1200, 'active': True, 'app': 'Antigravity', 'agents': [],     'waiting': []},
+        ]
+        d = datetime(2026, 11, 28, tzinfo=jst).date()
+        res = report_activity.analyze_records(recs, d, d)
+        cat = res['totals']['cat_s']
+        self.assertAlmostEqual(cat['human_only'], 70.0, places=1)
+        self.assertAlmostEqual(cat['human_and_ai'], 120.0, places=1)
+        self.assertAlmostEqual(cat['away_ai'], 120.0, places=1)
+        self.assertAlmostEqual(cat['away_waiting'], 60.0, places=1)
+        self.assertAlmostEqual(cat['idle'], 10.0, places=1)
+        self.assertAlmostEqual(res['totals']['app_active_s']['ChatGPT'], 60.0, places=1)
+        self.assertAlmostEqual(res['totals']['app_active_s']['Claude'], 120.0, places=1)
+        self.assertAlmostEqual(res['totals']['app_active_s']['Antigravity'], 10.0, places=1)
+        self.assertAlmostEqual(res['totals']['agent_s']['claude'], 120.0, places=1)
+        self.assertAlmostEqual(res['totals']['agent_s']['agy'], 120.0, places=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svg = Path(tmpdir) / 'out.svg'
+            report_activity.render_dashboard_svg(res, svg)
+            content = svg.read_text(encoding='utf-8')
+            self.assertIn('ChatGPT', content)
+            self.assertIn('Antigravity', content)
+            self.assertIn('ccmon 活動ログ 時間配分ダッシュボード', content)
 
 
 if __name__ == '__main__':
