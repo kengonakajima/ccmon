@@ -95,8 +95,15 @@ except ImportError:
 NEKO_SOUND_FILE = Path(__file__).resolve().parent / 'sounds' / 'neko.mp3'
 
 # 「自分のターン」アラーム設定
-# hooks/ccmon_state.py が Claude Code のフックから STATE_DIR に状態を書き、ここで監視する
-STATE_DIR = Path(os.environ.get('CCMON_STATE_DIR') or (CONFIG_DIR / 'state'))  # テスト時は差し替え可
+# hooks/ccmon_state.py（Claude Code）と hooks/ccmon_agy_state.py（agy）が状態を書き、ここで監視する
+
+
+def state_dir() -> Path:
+    """状態ディレクトリ。テストで Path.home() を差し替えたときも追従するよう、呼ぶたびに決める。"""
+    env = os.environ.get('CCMON_STATE_DIR')
+    return Path(env) if env else Path.home() / '.ccmon' / 'state'
+
+
 ALARM_INTERVAL_SECONDS = 10.0       # アラームの再生間隔
 ALARM_MAX_SECONDS = 15 * 60         # 1回の入力待ちで鳴らし続ける上限
 ALARM_STALE_SECONDS = 10 * 60       # 起動時にこれより古い待ち状態は無視（終了済みセッション対策）
@@ -380,7 +387,7 @@ class ActivityTracker:
 
 class WaitingRegistry:
     """Claude Code 各セッションの「入力待ち/作業中」状態を保持する。
-    状態は hooks/ccmon_state.py が STATE_DIR に書く JSON から読む。
+    状態は hooks/ccmon_state.py / ccmon_agy_state.py が state_dir() に書く JSON から読む。
     """
     def __init__(self):
         self._sessions = {}   # session_id -> record(dict)
@@ -391,7 +398,7 @@ class WaitingRegistry:
     def load_all(self):
         """起動時に既存の状態ファイルを読み込む。古い待ち状態は無視する。"""
         now = time.time()
-        for p in STATE_DIR.glob('*.json'):
+        for p in state_dir().glob('*.json'):
             rec = self._read(p)
             if rec is None:
                 continue
@@ -432,11 +439,11 @@ class WaitingRegistry:
         dprint(f"状態削除: {sid}")
 
     def refresh(self):
-        """STATE_DIR を走査し、変更されたファイルだけ読み直す。消えたファイルは登録から外す。
+        """state_dir() を走査し、変更されたファイルだけ読み直す。消えたファイルは登録から外す。
         FSEvents は rename 直後に偽の deleted を出すことがあるため、通知ではなく実在で判断する。
         """
         try:
-            entries = {p: p.stat() for p in STATE_DIR.glob('*.json')}
+            entries = {p: p.stat() for p in state_dir().glob('*.json')}
         except OSError:
             return
         current = {str(p): (st.st_mtime_ns, st.st_size) for p, st in entries.items()}
@@ -1212,7 +1219,7 @@ def main():
 
     # 「自分のターン」アラーム: フックが書く状態ディレクトリを監視
     waiting_registry = WAITING_REGISTRY
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_dir().mkdir(parents=True, exist_ok=True)
     waiting_registry.load_all()
     alarm_stop_event = threading.Event()
     alarm_thread = threading.Thread(

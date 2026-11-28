@@ -76,6 +76,49 @@ Claude Code のフックを使って、セッションが入力待ちになっ�
 - `ALARM_ONLY_WHEN_IDLE` / `ALARM_IDLE_SECONDS`: `True` にすると、キーボード・マウスを一定時間触っていない時だけ鳴らす
 - アラーム音: `sounds/alarm.mp3`（`.aiff` / `.wav` も可）を置けばそれを使い、なければ macOS の `Glass.aiff`
 
+### 「自分のターン」アラーム（Antigravity / agy）
+
+`agy` のフック機能（`~/.gemini/config/hooks.json`）に `hooks/ccmon_agy_state.py` を登録すると、以下のタイミングで Claude Code と同じ 10 秒おきアラームが鳴ります：
+
+- ファイル編集（diff 許可待ち: `edit_file` / `write_file` 等）
+- コマンド実行の許可待ち（`run_command`）
+- 質問の回答待ち（`ask_question`）
+- 会話のターン完了（`Stop`）
+
+`~/.gemini/config/hooks.json` の設定例：
+
+```json
+{
+  "ccmon-state": {
+    "SessionStart": [
+      { "type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_agy_state.py\"", "timeout": 10 }
+    ],
+    "PreInvocation": [
+      { "type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_agy_state.py\"", "timeout": 10 }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content|ask_question",
+        "hooks": [
+          { "type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_agy_state.py\"", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_agy_state.py\"", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "type": "command", "command": "\"/path/to/ccmon/venv/bin/python3\" \"/path/to/ccmon/hooks/ccmon_agy_state.py\"", "timeout": 10 }
+    ]
+  }
+}
+```
+
 ## 動作説明
 
 CCMonは以下の活動を監視します：
